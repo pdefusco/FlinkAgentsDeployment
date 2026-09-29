@@ -187,15 +187,16 @@ The agents in Step 4 read from Kafka and call the NiFi REST API, so both need to
 
 ```bash
 # DataFlow (CDF) on the environment
+# NB: `cdp` has no --query (unlike az/aws) — pipe its JSON through jq instead.
 cdp df enable-service --environment-crn "$(cdp environments describe-environment \
-  --environment-name <env-name> --query 'environment.crn' --output text)" \
+  --environment-name <env-name> | jq -r '.environment.crn')" \
   --min-k8s-node-count 3 --max-k8s-node-count 5 --use-public-load-balancer
 
 cdp df list-services
 
 # A Streaming Data Hub for the Kafka brokers
 cdp datahub list-cluster-definitions \
-  --query 'clusterDefinitions[?contains(clusterDefinitionName, `Streaming`)].clusterDefinitionName'
+  | jq -r '.clusterDefinitions[].clusterDefinitionName' | grep -i streaming
 
 cdp datahub create-azure-cluster \
   --cluster-name <kafka-cluster> \

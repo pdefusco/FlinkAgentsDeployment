@@ -322,11 +322,24 @@ ratatoskr agent submit my_agent
 This is the part that is genuinely hard, and it is **per cluster, not per agent** — do it once, then
 Part 4 is cheap and repeatable. Full detail in the runbook; the shape of it:
 
+> **Two different usernames are in play — this catches everyone once.**
+>
+> | | Who | Used for |
+> |---|---|---|
+> | `<os-user>` | The cloud OS account CDP creates — **`cloudbreak`** on AWS | `ssh` / `scp`, paired with the SSH key from environment creation |
+> | `<workload-user>` | Your CDP **workload** username | `kinit`, and therefore your HDFS/YARN identity |
+>
+> You log in as the OS account and *then* `kinit` as your workload user. The Kerberos identity comes
+> from the ticket, not from the OS login, so these do not have to match and normally don't. Getting
+> the gateway FQDN: `cdp datahub describe-cluster --cluster-name <cluster>` — you want the node in
+> the **`GATEWAY`** instance group, not a master. Use `ssh -A` if you need to reach worker nodes;
+> they are only reachable by hopping through the gateway.
+
 **Probe first.** This can end the exercise in ten minutes rather than after a day of building:
 
 ```bash
-scp datahub/scripts/probe_csa_gateway.sh <user>@<gateway>:~/
-ssh <user>@<gateway> 'bash ~/probe_csa_gateway.sh'
+scp datahub/scripts/probe_csa_gateway.sh <os-user>@<gateway>:~/
+ssh <os-user>@<gateway> 'bash ~/probe_csa_gateway.sh'
 ```
 
 The decisive check is whether the Flink parcel ships `flink-python-*.jar` in `$FLINK_HOME/lib/`. If
@@ -352,9 +365,9 @@ is a thin `--system-site-packages` venv over the node's own stack, not a cross-b
 instead of 626 MB**, and matched by construction rather than by luck:
 
 ```bash
-scp -r dist/csa/ <user>@<gateway>:~/ratatoskr-csa/
-scp datahub/scripts/build_csa_venv_gateway.sh <user>@<gateway>:~/ratatoskr-csa/
-ssh <user>@<gateway>
+scp -r dist/csa/ <os-user>@<gateway>:~/ratatoskr-csa/
+scp datahub/scripts/build_csa_venv_gateway.sh <os-user>@<gateway>:~/ratatoskr-csa/
+ssh <os-user>@<gateway>
 cd ~/ratatoskr-csa && ./build_csa_venv_gateway.sh
 ```
 
@@ -389,14 +402,14 @@ is copied by name**, though — the script has `cp examples/agents/run_workflow_
 ```bash
 SKIP_DOCKER=1 datahub/scripts/build_csa_bundle.sh    # rebuilds only agentcode.zip, seconds not minutes
 cp examples/agents/run_my_agent_cluster_csa.py dist/csa/
-scp -r dist/csa/ <user>@<gateway>:~/ratatoskr-csa/
+scp -r dist/csa/ <os-user>@<gateway>:~/ratatoskr-csa/
 ```
 
 **3. Inspect the command, then submit.**
 
 ```bash
-ssh <user>@<gateway>
-kinit <user>
+ssh <os-user>@<gateway>
+kinit <workload-user>
 cd ~/ratatoskr-csa
 
 ENTRY=run_my_agent_cluster_csa.py DRY_RUN=1 ./submit_agent_csa.sh   # print, don't submit

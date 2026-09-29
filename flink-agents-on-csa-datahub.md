@@ -217,7 +217,7 @@ Find the exact cluster definition name for your CDP version and cloud rather tha
 
 ```bash
 cdp datahub list-cluster-definitions \
-  --query 'clusterDefinitions[?contains(clusterDefinitionName, `Streaming Analytics`)].clusterDefinitionName'
+  | jq -r '.clusterDefinitions[].clusterDefinitionName' | grep -i 'streaming analytics'
 ```
 
 You want a **Streaming Analytics Light Duty** definition for this work. Heavy Duty is for
@@ -241,19 +241,36 @@ whose type is `GATEWAY` — **not** a master:
 
 ```bash
 cdp datahub describe-cluster --cluster-name my-csa-cluster \
-  --query 'cluster.instanceGroups[].instances[].{fqdn:fqdn,id:instanceGroupName,type:instanceType}' \
-  --output table
+  | jq -r '.cluster.instanceGroups[]
+           | .name as $group
+           | .instances[]
+           | [$group, (.instanceType // "-"), .fqdn] | @tsv'
 ```
 
+The group name has to be bound with `as $group` before descending into `.instances[]` — it is a field
+of the *group*, not of the instance, so reading it off the instance silently yields a blank column.
+
+> **Use `jq`, not `--query`.** `cdp` has a global `--output`, but **no `--query`** — unlike the AWS and
+> Azure CLIs. Passing one fails with `Unknown options: --query` (checked against cdpcli 0.9.164).
+> `cdp` emits JSON by default, so pipe it. If a field name here does not match your CDP version, pipe
+> the raw output through `jq '.cluster.instanceGroups[0]'` and read the actual shape rather than
+> guessing — these filters are syntax-checked against the documented schema but not against a live API.
+
 ```bash
-ssh-add --apple-use-keychain ~/.ssh/<your-ec2-key>    # macOS; omit the flag elsewhere
-ssh <workload-user>@<gateway-fqdn>
+ssh-add --apple-use-keychain ~/.ssh/<your-ssh-key>    # macOS; omit the flag elsewhere
+ssh <os-user>@<gateway-fqdn>                          # cloudbreak on AWS
+kinit <workload-user>                                 # then take on your workload identity
 ```
 
 Two things that cost time here if you get them wrong:
 
-- **Use your CDP *workload* username**, not the OS account and not your Console email. The OS login
-  (`cloudbreak` on AWS) is not a Kerberos principal, has no ticket, and cannot reach HDFS or YARN.
+- **SSH as the cloud OS account, then `kinit` as your workload user.** These are two different
+  identities and they normally differ. On AWS the OS account is **`cloudbreak`**, paired with the SSH
+  key you supplied at environment creation, and it is what was used for every connection in this work.
+  It is true that `cloudbreak` is not a Kerberos principal — but that is irrelevant to SSH, because
+  your Kerberos identity comes from the ticket you obtain *after* logging in, not from the OS login.
+  Do not `kinit cloudbreak`; it has no principal. Your workload username is what reaches HDFS and
+  YARN, and it is what the YARN job runs as.
 - **Use `ssh -A`** if you need to reach worker nodes — they are only reachable by hopping through the
   gateway, and without agent forwarding your key is not available for the second hop.
 
