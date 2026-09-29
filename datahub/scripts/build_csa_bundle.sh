@@ -2,12 +2,17 @@
 # Build the Flink Agents bundle for a Cloudera CSA DataHub (Flink 1.20 on YARN).
 #
 # Produces dist/csa/:
-#   agentenv.tar.gz      self-contained conda env (python 3.11, PyFlink 1.20, pemja,
-#                        flink-agents wheel, and the dist jars pre-staged inside)
+#   wheel/               the flink_agents wheel. REQUIRED by build_csa_venv_gateway.sh,
+#                        which is the live path — scp it to the gateway alongside that
+#                        script. (Large: the wheel carries the dist jars internally.)
 #   jars/                the two Flink Agents dist jars, for -Dpipeline.jars
 #   agentcode.zip        ratatoskr runtime + example agents, for -pyfs
 #   run_workflow_cluster_csa.py   job entry point, for -py
+#   submit_agent_csa.sh  the submit path, copied here so it travels with the bundle
 #   BUILD-INFO.txt       what was built, so the cluster can be cross-checked
+#   agentenv.tar.gz      self-contained conda env (python 3.11, PyFlink 1.20, pemja,
+#                        flink-agents wheel, dist jars pre-staged inside). SUPERSEDED —
+#                        the gateway venv replaced it; nothing ships this to the cluster.
 #
 # Usage:
 #   scripts/build_csa_bundle.sh                       # defaults (Flink 1.20, amd64)
@@ -67,6 +72,10 @@ docker cp "$CID:/out/agentenv.tar.gz"        "$OUT_DIR/"
 docker cp "$CID:/out/jars"                   "$OUT_DIR/"
 docker cp "$CID:/out/BUILD-INFO.txt"         "$OUT_DIR/"
 docker cp "$CID:/out/site-packages-path.txt" "$OUT_DIR/"
+# The wheel is what build_csa_venv_gateway.sh installs on the gateway, so it MUST come
+# out of the image. Omitting this is a silent trap: the venv script's "no wheel found"
+# check fires only after you have already scp'd a bundle to the cluster.
+docker cp "$CID:/out/wheel"                  "$OUT_DIR/"
 
 fi   # end SKIP_DOCKER
 

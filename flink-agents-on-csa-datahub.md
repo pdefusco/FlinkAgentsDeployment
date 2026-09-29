@@ -648,8 +648,16 @@ SKIP_DOCKER=1 datahub/scripts/build_csa_bundle.sh
 | `SKIP_DOCKER` | `0` | `1` skips the build and only rebuilds `agentcode.zip` |
 
 `OUT_DIR` is fixed at `$REPO_ROOT/dist/csa` and is not overridable. Outputs land there:
-`jars/`, `agentenv.tar.gz`, `agentcode.zip`, `run_workflow_cluster_csa.py`,
-`submit_agent_csa.sh` (made executable), `BUILD-INFO.txt`, `site-packages-path.txt`.
+
+| Output | Used by |
+|---|---|
+| `wheel/flink_agents-*.whl` | `build_csa_venv_gateway.sh`, on the gateway. **Required** — scp it across with that script |
+| `jars/` | The two dist jars, attached by `add_jars` in the entry point |
+| `agentcode.zip` | Rebuilt into the `-pyfs` payload by `submit_agent_csa.sh` |
+| `run_workflow_cluster_csa.py` | The `-py` entry point |
+| `submit_agent_csa.sh` | Copied here (and `chmod +x`) so it travels with the bundle |
+| `BUILD-INFO.txt`, `site-packages-path.txt` | Cross-checking what was built |
+| `agentenv.tar.gz` | **Superseded.** The 626 MB conda env from the original design; nothing ships it |
 
 > **`FLINK_PATCH_VERSION` and `BUILD-INFO.txt` describe the build container, not your cluster.** This
 > variable feeds `pip install apache-flink==…` inside the image, which mattered only for the original
