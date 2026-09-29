@@ -30,6 +30,200 @@ Cloudera DataFlow (CDP Public Cloud, Azure)          Your AKS cluster (same VNet
 
 ---
 
+## Provisioning the infrastructure from scratch
+
+Skip this section if the environment, AKS cluster and ACR in the prerequisites already exist — go
+straight to [Step 1](#step-1-install-the-csa-operator-into-aks).
+
+> **None of the commands in this section were run for this repo.** The operator path is documented
+> from Cloudera's published behaviour and the CSA Operator Helm chart; only the [Data Hub
+> path](./flink-agents-on-csa-datahub.md) was verified end to end. Azure CLI and CDP CLI flag sets
+> also vary between versions — use `az <group> <cmd> --help` and
+> `cdp <service> <cmd> --generate-cli-skeleton` to confirm against your own versions. **Treat
+> everything below as a checklist of what must exist, not as verified copy-paste.**
+
+### 1. Install and authenticate the CLIs
+
+```bash
+# Azure CLI
+az login
+az account set --subscription <subscription-id>
+az account show
+
+# CDP CLI
+pip install cdpcli
+cdp configure                      # access key + private key from Management Console → User Management
+cdp iam get-user                   # confirm auth
+
+# Set the workload password — the Kafka and NiFi REST paths both use it
+cdp iam set-workload-password --password '<workload-password>'
+```
+
+### 2. Azure prerequisites for the CDP environment
+
+CDP needs these to exist before it will register an Azure environment. Cloudera publishes a
+`cdp-azure-prerequisites` ARM template that creates most of them in one step; doing it by hand means:
+
+| What | Why |
+|---|---|
+| Resource group | Everything below lives in it |
+| VNet with at least 3 subnets across availability zones | Data Lake and Data Hub node placement |
+| Storage account (ADLS Gen2, **hierarchical namespace enabled**) with containers for data and logs | Data Lake storage and log collection. HNS is required, not optional |
+| App registration (service principal) with **Contributor** on the resource group | How CDP provisions on your behalf |
+| Managed identities for the Data Lake admin, log collection, Ranger audit, and IDBroker | Cloudera's mandatory identity set — these carry the role assignments onto the storage containers |
+| SSH public key | Node access |
+
+```bash
+az group create --name <rg> --location <region>
+
+az network vnet create \
+  --resource-group <rg> --name <vnet> \
+  --address-prefix 10.10.0.0/16 \
+  --subnet-name cdp-subnet-1 --subnet-prefix 10.10.0.0/20
+
+# add two more subnets in other zones
+az network vnet subnet create --resource-group <rg> --vnet-name <vnet> \
+  --name cdp-subnet-2 --address-prefix 10.10.16.0/20
+az network vnet subnet create --resource-group <rg> --vnet-name <vnet> \
+  --name cdp-subnet-3 --address-prefix 10.10.32.0/20
+
+# ADLS Gen2 — hierarchical namespace is required
+az storage account create \
+  --resource-group <rg> --name <storageacct> \
+  --sku Standard_LRS --kind StorageV2 --hns true
+```
+
+Then register the credential with CDP:
+
+```bash
+cdp environments create-azure-credential \
+  --credential-name <cred-name> \
+  --subscription-id <subscription-id> \
+  --tenant-id <tenant-id> \
+  --app-based applicationId=<app-id>,secretKey=<client-secret>
+
+cdp environments list-credentials
+```
+
+### 3. Create the environment and Data Lake
+
+```bash
+cdp environments create-azure-environment \
+  --environment-name <env-name> \
+  --credential-name <cred-name> \
+  --region <region> \
+  --security-access cidr=<your-cidr> \
+  --public-key '<ssh-public-key>' \
+  --resource-group-name <rg> \
+  --existing-network-params networkId=<vnet>,resourceGroupName=<rg>,subnetIds=cdp-subnet-1,cdp-subnet-2,cdp-subnet-3 \
+  --log-storage storageLocationBase=abfs://logs@<storageacct>.dfs.core.windows.net,managedIdentity=<log-identity-id> \
+  --use-public-ip
+
+cdp environments describe-environment --environment-name <env-name>
+
+cdp datalake create-azure-datalake \
+  --datalake-name <datalake-name> \
+  --environment-name <env-name> \
+  --cloud-provider-configuration managedIdentity=<idbroker-identity-id>,storageLocation=abfs://data@<storageacct>.dfs.core.windows.net \
+  --scale LIGHT_DUTY
+
+cdp datalake describe-datalake --datalake-name <datalake-name>
+cdp environments sync-all-users
+```
+
+Environment creation takes 20–40 minutes, most of it FreeIPA. The Data Lake is what brings up Ranger
+and Knox, and Knox is what the DataFlow and AI Inference calls in Steps 4 and 5 go through.
+
+### 4. Create the AKS cluster and ACR
+
+This is the part that has no CDP equivalent — on this path **you own the Kubernetes cluster**. Put it
+in the same VNet as the CDP environment if you can, or peer it; the agents need to reach the Data Hub
+Kafka brokers and the NiFi REST endpoint over in-VNet hostnames.
+
+```bash
+az acr create --resource-group <rg> --name <youracr> --sku Standard
+
+# Option A — AKS in a subnet of the CDP VNet (no peering needed)
+az network vnet subnet create --resource-group <rg> --vnet-name <vnet> \
+  --name aks-subnet --address-prefix 10.10.48.0/20
+
+az aks create \
+  --resource-group <rg> --name <aks-name> \
+  --node-count 3 --node-vm-size Standard_D4s_v3 \
+  --network-plugin azure \
+  --vnet-subnet-id "$(az network vnet subnet show --resource-group <rg> \
+      --vnet-name <vnet> --name aks-subnet --query id -o tsv)" \
+  --attach-acr <youracr> \
+  --generate-ssh-keys
+
+az aks get-credentials --resource-group <rg> --name <aks-name>
+kubectl get nodes
+```
+
+`--attach-acr` grants the cluster's kubelet identity `AcrPull`, which is what lets the
+`FlinkDeployment` in Step 3 pull your image without a pull secret of its own. (You still need the
+`cloudera-creds` secret in Step 1 — that is for Cloudera's registry, not yours.)
+
+If AKS is in a **separate** VNet, peer it in both directions:
+
+```bash
+az network vnet peering create --resource-group <rg> \
+  --name aks-to-cdp --vnet-name <aks-vnet> \
+  --remote-vnet "$(az network vnet show -g <rg> -n <vnet> --query id -o tsv)" \
+  --allow-vnet-access
+
+az network vnet peering create --resource-group <rg> \
+  --name cdp-to-aks --vnet-name <vnet> \
+  --remote-vnet "$(az network vnet show -g <rg> -n <aks-vnet> --query id -o tsv)" \
+  --allow-vnet-access
+```
+
+A peering that exists in only one direction reports `Connected` on the side you created and still
+drops traffic. Check both.
+
+### 5. Create the DataFlow service and a Data Hub for Kafka
+
+The agents in Step 4 read from Kafka and call the NiFi REST API, so both need to exist:
+
+```bash
+# DataFlow (CDF) on the environment
+cdp df enable-service --environment-crn "$(cdp environments describe-environment \
+  --environment-name <env-name> --query 'environment.crn' --output text)" \
+  --min-k8s-node-count 3 --max-k8s-node-count 5 --use-public-load-balancer
+
+cdp df list-services
+
+# A Streaming Data Hub for the Kafka brokers
+cdp datahub list-cluster-definitions \
+  --query 'clusterDefinitions[?contains(clusterDefinitionName, `Streaming`)].clusterDefinitionName'
+
+cdp datahub create-azure-cluster \
+  --cluster-name <kafka-cluster> \
+  --environment-name <env-name> \
+  --cluster-definition-name '<definition-from-above>'
+```
+
+Then deploy a NiFi flow through the DataFlow Catalog, and note its Inbound Connection endpoint — Step
+4 needs it.
+
+### 6. Confirm before building the image
+
+```bash
+kubectl get nodes                                    # AKS reachable
+az acr login --name <youracr>                        # ACR push works
+cdp datalake describe-datalake --datalake-name <datalake-name> | grep status
+cdp df list-deployments                              # the NiFi flow is running
+# Kafka broker reachability from inside the cluster:
+kubectl run netcheck --rm -it --image=busybox --restart=Never -- \
+  nc -zv <broker-host> 9093
+```
+
+That last check is the one worth not skipping. If a pod in AKS cannot open 9093 on a Data Hub broker,
+the peering or the security group is wrong, and you will otherwise discover it several steps later as
+a Flink job that starts cleanly and consumes nothing.
+
+---
+
 ## Step 1. Install the CSA Operator into AKS
 
 The CSA Operator ships as an OCI Helm chart. It installs the Flink Kubernetes Operator, which manages the `FlinkDeployment` and `FlinkSessionJob` custom resources, and the SQL Stream Builder services. Create a namespace for it and a pull secret for the Cloudera registry first.
@@ -205,12 +399,50 @@ kubectl apply -f flinkdeployment.yaml
 kubectl get flinkdeployment -n flink-agents   # wait for STABLE
 ```
 
-Smoke-test the cluster by submitting one of the built-in quickstart agents as a Flink job from the JobManager pod and watching it in the Flink UI.
+### Smoke-test with the simplest possible agent
+
+Before wiring anything to Kafka or an LLM, prove that the image can run a Flink Agents job at all.
+This is the same test as the Data Hub path's milestone, and for the same reason: if pemja's two halves
+disagree or the dist jars are not on the classpath, **this** is where you want to find out, not three
+integrations later.
+
+`smoke_counter.py` — no Kafka, no LLM, no external state:
+
+```python
+from pyflink.datastream import StreamExecutionEnvironment
+from flink_agents.api.execution_environment import AgentsExecutionEnvironment
+
+from agents.workflow_counter import CounterAgent   # your agent
+
+env = StreamExecutionEnvironment.get_execution_environment()
+env.set_parallelism(1)
+agents_env = AgentsExecutionEnvironment.get_execution_environment(env)
+
+records = [{"key": str(i), "value": i * 5} for i in range(1, 4)]
+stream = env.from_collection(records)
+keyed = agents_env.from_datastream(input=stream, key_selector=lambda row: row["key"])
+keyed.apply(CounterAgent()).to_datastream().print()
+agents_env.execute("smoke counter")
+```
+
+Add it to the image alongside your agents (Step 2 already `COPY`s an agents directory into
+`/opt/flink/usrlib/agents/`), then:
 
 ```bash
 kubectl exec -it deploy/flink-agents -n flink-agents -- \
-  flink run -py /opt/flink/usrlib/agents/<quickstart>.py
+  flink run -py /opt/flink/usrlib/agents/smoke_counter.py
+
+# the printed records land in the TaskManager log
+kubectl logs -n flink-agents -l component=taskmanager --tail=50 | grep doubled
 ```
+
+Three records in, three doubled records out, job `FINISHED`. Note what is **not** here that the Data
+Hub path needs: no `-yD` flags, no `-pyfs` zip, no classpath ordering, no Kerberos. Everything those
+compensate for was settled when you built the image — which is the whole argument for this path.
+
+> The [Data Hub example](./datahub/examples/run_workflow_cluster_csa.py) is the same agent with a
+> preflight wrapper around it, because there the environment is discovered at submit time rather than
+> baked in. Comparing the two files is a quick way to see exactly what the operator path buys you.
 
 ---
 

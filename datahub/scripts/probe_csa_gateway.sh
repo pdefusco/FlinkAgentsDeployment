@@ -79,9 +79,9 @@ if [ -n "$FOUND" ]; then
   fi
   # CSA also ships the matching PyFlink WHEEL SET here. This is the authoritative
   # source for every runtime pin: build the shipped env from these wheels rather than
-  # resolving from PyPI, because Cloudera patches the dependency set (their
-  # apache-flink 1.20.5 requires pemja 0.5.7, where upstream 1.20.1 pins pemja 0.4.1 —
-  # a mismatch that resolves cleanly and then dies in a TaskManager).
+  # resolving from PyPI against a guessed version, because the pins move within a Flink
+  # minor (apache-flink 1.20.5 requires pemja 0.5.7, where 1.20.1 pins pemja 0.4.1 — both
+  # upstream — a mismatch that resolves cleanly and then dies in a TaskManager).
   WHEELDIR="$FOUND/lib/flink-python-source"
   if [ -d "$WHEELDIR" ]; then
     note "--- parcel wheel set: $WHEELDIR ($(ls "$WHEELDIR"/*.whl 2>/dev/null | wc -l | tr -d ' ') wheels) ---"

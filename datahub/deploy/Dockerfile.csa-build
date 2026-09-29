@@ -21,10 +21,13 @@
 # So the live path is scripts/build_csa_venv_gateway.sh, which runs ON THE GATEWAY and
 # creates a --system-site-packages venv inheriting that stack: 13MB instead of 626MB, no
 # cross-compilation, no conda-pack relocation, and — the real point — no guessed pemja
-# version. pemja is a JNI bridge whose two halves must match, and Cloudera PATCHES the
-# pin (their apache-flink 1.20.5 needs pemja>=0.5.7,<0.5.8; upstream 1.20.1 pins 0.4.1).
-# Stage 3 resolved from PyPI and so produced pemja 0.4.1: it installed clean, imported
+# version. pemja is a JNI bridge whose two halves must match, and the pin MOVES WITHIN A
+# FLINK MINOR: apache-flink 1.20.1 pins pemja==0.4.1, apache-flink 1.20.5 pins
+# pemja>=0.5.7,<0.5.8. Both are upstream PyPI releases — this is NOT a Cloudera patch,
+# which makes it easier to miss, not harder. FLINK_PATCH_VERSION below defaults to 1.20.1,
+# so Stage 3 resolved pemja 0.4.1 against a 1.20.5 cluster: it installed clean, imported
 # clean, passed a clean-RHEL9 container check, and would have failed inside a TaskManager.
+# Matching the MINOR (1.20) is not sufficient; the Python stack must match the PATCH.
 #
 # Stage 3 is KEPT, not deleted: it is the fallback for a cluster whose nodes lack the
 # system stack, and for the CSA-Operator-on-AKS path. Do not "fix" its pins against PyPI

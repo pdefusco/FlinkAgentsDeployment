@@ -34,12 +34,13 @@
 #      become irrelevant rather than merely working.
 #   3. **pemja stops being a guess.** pemja is a JNI bridge: the Java classes in
 #      flink-python-*.jar and the Python pemja_core*.so MUST be the same version.
-#      Cloudera PATCHES this pin — their apache-flink 1.20.5 requires pemja>=0.5.7,<0.5.8,
-#      where upstream apache-flink 1.20.1 pins pemja==0.4.1. The Docker bundle resolved
-#      from PyPI and therefore contained pemja 0.4.1: it installed cleanly, imported
+#      That pin MOVES WITHIN A FLINK MINOR: apache-flink 1.20.5 requires pemja>=0.5.7,<0.5.8,
+#      where apache-flink 1.20.1 pins pemja==0.4.1. Both are upstream PyPI releases, so this
+#      is not something a "use Cloudera's wheels" rule catches by itself. The Docker bundle
+#      pinned 1.20.1 and therefore contained pemja 0.4.1: it installed cleanly, imported
 #      cleanly, passed a clean-RHEL9 container check, and would have died inside a
-#      TaskManager with an error that reads like a classloader bug. Inheriting the node's
-#      own pemja makes that class of mismatch structurally impossible.
+#      TaskManager with an error that reads like a classloader bug. Matching the MINOR is
+#      not enough. Inheriting the node's own pemja makes the mismatch structurally impossible.
 #
 # `--system-site-packages` is what makes this work: the venv inherits the node's
 # installed stack instead of duplicating it, and `bin/python3.11` is a symlink to

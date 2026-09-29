@@ -255,8 +255,10 @@ fi
 # classes in flink-python-*.jar and the Python pemja_core*.so must be the same version,
 # or the job dies inside a TaskManager with a pemja ClassCast/UnsatisfiedLinkError that
 # reads like a classloader problem and sends you hunting FLINK-39226 instead of a
-# version skew. Cloudera PATCHES this pin: CSA's apache-flink 1.20.5 requires
-# pemja>=0.5.7,<0.5.8, where UPSTREAM apache-flink 1.20.1 pins pemja==0.4.1.
+# version skew. The pin MOVES WITHIN A FLINK MINOR: apache-flink 1.20.5 requires
+# pemja>=0.5.7,<0.5.8, where apache-flink 1.20.1 pins pemja==0.4.1 — both upstream on
+# PyPI. So a bundle built for the right MINOR can still carry the wrong pemja. That is
+# exactly what this check exists to catch.
 if [ -d "$PARCEL_WHEELS" ]; then
   for pkg in pemja apache_flink; do
     dist="${pkg//_/-}"

@@ -111,6 +111,156 @@ works normally.
 
 ---
 
+## Provisioning the infrastructure from scratch
+
+**Already have a Streaming Analytics Data Hub you can SSH into? Skip to [Step 0](#step-0-probe-the-cluster-before-building-anything).**
+
+This section builds the substrate on AWS. It is a large one-time operation, and most people do the
+environment and Data Lake in the **CDP Console** rather than the CLI — the Console validates
+networking and IAM as you go, which the CLI will not. The CLI commands below are the shape of it, so
+you can script or review it.
+
+> **Flag sets vary by CDP version.** Before running any `create-*` command, get the exact shape for
+> *your* control plane rather than trusting a copied command line:
+>
+> ```bash
+> cdp environments create-aws-environment --generate-cli-skeleton > env.json
+> # fill in env.json, then:
+> cdp environments create-aws-environment --cli-input-json file://env.json
+> ```
+>
+> `cdp <service> <command> --help` lists the required flags. Treat everything below as a checklist of
+> what must exist, not as verified copy-paste.
+
+### 1. Install and authenticate the CDP CLI
+
+```bash
+pip install cdpcli
+cdp configure                 # CDP access key ID + private key, from Console → Profile → Access Keys
+cdp iam get-user              # verify auth works, and note your workload username
+```
+
+Set a **workload password** — a separate credential from your Console login, and the one that reaches
+HDFS, YARN and Kafka:
+
+```bash
+cdp iam set-workload-password --password '<workload-password>'
+```
+
+### 2. AWS prerequisites
+
+CDP needs these to exist before an environment can be created. Cloudera's `cdp-cli` quickstart
+templates or the `cloudera/cdp-aws-quickstart` CloudFormation stack will create the whole set; doing
+it by hand means:
+
+| What | Why |
+|---|---|
+| **VPC** with 3+ subnets across AZs | CDP requires multi-AZ. Tag subnets for internal load balancers if using private endpoints |
+| **S3 bucket** | Data Lake storage plus logs. Two prefixes: one for data, one for logs |
+| **Cross-account IAM role** | CDP's control plane assumes this to manage resources in your account |
+| **IDBroker + Data Lake admin/ranger IAM roles** | Map CDP users to S3 access |
+| **EC2 key pair** | The SSH key for cluster nodes — **you need this for the Data Hub path** |
+| **Security groups** | Gateway ingress on 22 (SSH) and 443 (Knox) from your CIDR |
+
+Register the cross-account role as a CDP credential:
+
+```bash
+cdp environments create-aws-credential \
+  --credential-name my-aws-cred \
+  --role-arn arn:aws:iam::<account-id>:role/<cdp-cross-account-role>
+```
+
+### 3. Create the environment and Data Lake
+
+```bash
+cdp environments create-aws-environment \
+  --environment-name my-cdp-env \
+  --credential-name my-aws-cred \
+  --region us-west-2 \
+  --security-access cidr=<your-office-cidr>/32 \
+  --authentication publicKeyId=<your-ec2-keypair-name> \
+  --log-storage storageLocationBase=s3a://my-bucket/logs,instanceProfile=arn:aws:iam::<acct>:instance-profile/<log-role> \
+  --vpc-id vpc-xxxxxxxx \
+  --subnet-ids subnet-aaa,subnet-bbb,subnet-ccc \
+  --free-ipa instanceCountByGroup=1
+
+cdp environments describe-environment --environment-name my-cdp-env \
+  | grep -E '"status"|"environmentName"'
+```
+
+Wait for `AVAILABLE` — FreeIPA provisioning takes roughly 20–40 minutes. Then the Data Lake:
+
+```bash
+cdp datalake create-aws-datalake \
+  --datalake-name my-cdp-dl \
+  --environment-name my-cdp-env \
+  --cloud-provider-configuration \
+      instanceProfile=arn:aws:iam::<acct>:instance-profile/<idbroker-role>,storageBucketLocation=s3a://my-bucket/data \
+  --scale LIGHT_DUTY
+
+cdp datalake describe-datalake --datalake-name my-cdp-dl | grep '"status"'
+```
+
+The **Data Lake is what enables Ranger and RAZ** — and if RAZ is on, you will hit
+[the JobManager crash loop](#the-jobmanager-crash-loop-with-no-visible-cause) below. That is expected
+and fixable; it is not a reason to skip RAZ.
+
+Then sync your user so the Kerberos principal exists on the clusters:
+
+```bash
+cdp environments sync-all-users
+```
+
+### 4. Create the Streaming Analytics Data Hub
+
+Find the exact cluster definition name for your CDP version and cloud rather than guessing it:
+
+```bash
+cdp datahub list-cluster-definitions \
+  --query 'clusterDefinitions[?contains(clusterDefinitionName, `Streaming Analytics`)].clusterDefinitionName'
+```
+
+You want a **Streaming Analytics Light Duty** definition for this work. Heavy Duty is for
+state-intensive production workloads and costs considerably more; Light Duty is sufficient to run and
+verify agents. Then:
+
+```bash
+cdp datahub create-aws-cluster \
+  --cluster-name my-csa-cluster \
+  --environment-name my-cdp-env \
+  --cluster-definition-name '<exact name from the command above>'
+
+# watch it come up (10-20 min)
+cdp datahub describe-cluster --cluster-name my-csa-cluster | grep '"status"'
+```
+
+### 5. Get the gateway hostname and confirm SSH
+
+This is the step that decides whether the whole path is open to you. The node you want is the one
+whose type is `GATEWAY` — **not** a master:
+
+```bash
+cdp datahub describe-cluster --cluster-name my-csa-cluster \
+  --query 'cluster.instanceGroups[].instances[].{fqdn:fqdn,id:instanceGroupName,type:instanceType}' \
+  --output table
+```
+
+```bash
+ssh-add --apple-use-keychain ~/.ssh/<your-ec2-key>    # macOS; omit the flag elsewhere
+ssh <workload-user>@<gateway-fqdn>
+```
+
+Two things that cost time here if you get them wrong:
+
+- **Use your CDP *workload* username**, not the OS account and not your Console email. The OS login
+  (`cloudbreak` on AWS) is not a Kerberos principal, has no ticket, and cannot reach HDFS or YARN.
+- **Use `ssh -A`** if you need to reach worker nodes — they are only reachable by hopping through the
+  gateway, and without agent forwarding your key is not available for the second hop.
+
+Once you are on the gateway with a working `kinit`, continue to Step 0.
+
+---
+
 ## Step 0. Probe the cluster before building anything
 
 These are cheap and they can kill the approach in ten minutes instead of after a day of building.
@@ -156,13 +306,18 @@ This replaced a 626MB cross-compiled conda-pack archive with a **13MB venv built
 and it removed the single largest source of risk in the whole exercise:
 
 > **pemja stops being a guess.** pemja is a JNI bridge — the Java classes in `flink-python-*.jar` and
-> the Python `pemja_core*.so` **must be the same version**. Cloudera **patches this pin**: their
-> `apache-flink 1.20.5` requires `pemja>=0.5.7,<0.5.8`, where upstream `apache-flink 1.20.1` pins
-> `pemja==0.4.1`. A bundle resolved from PyPI therefore contains pemja 0.4.1. It installs cleanly,
-> imports cleanly, passes a clean-container check — and dies inside the TaskManager JVM, where the
-> only way to test it is to submit a job.
+> the Python `pemja_core*.so` **must be the same version**. And that version moves *within* a Flink
+> minor: `apache-flink 1.20.1` pins `pemja==0.4.1`, while `apache-flink 1.20.5` pins
+> `pemja>=0.5.7,<0.5.8`. Both are upstream PyPI releases. Our build defaulted to `1.20.1`, so it
+> resolved pemja 0.4.1 against a cluster running 1.20.5 and pemja 0.5.7. That bundle installs
+> cleanly, imports cleanly, passes a clean-container check — and dies inside the TaskManager JVM,
+> where the only way to test it is to submit a job.
 
-Build against what the node has. Do not resolve this stack from PyPI.
+**Matching the Flink minor is not enough — the Python stack must match the cluster's patch version.**
+That is a much easier thing to get wrong than it sounds, because every jar and module in this project
+is selected by minor (`dist/flink-1.20`) and nothing about a `1.20` bundle warns you that its pemja
+belongs to a different `1.20.x`. Building on the gateway against the node's own stack sidesteps the
+question entirely, which is why that is the live path.
 
 ---
 
@@ -407,20 +562,242 @@ State this plainly to anyone who asks to run it in production:
   this work modified, installed, or wrote anything on any cluster node — every cluster file was read
   only.
 
-## What is in `datahub/`
+## Script reference
 
-| Path | What it is |
-|---|---|
-| [`scripts/probe_csa_gateway.sh`](./datahub/scripts/probe_csa_gateway.sh) | Step 0's go/no-go probes, as one script |
-| [`deploy/Dockerfile.csa-build`](./datahub/deploy/Dockerfile.csa-build) | `linux/amd64` build of the `flink-agents` 1.20 jars and wheel |
-| [`scripts/build_csa_bundle.sh`](./datahub/scripts/build_csa_bundle.sh) | Drives that build, assembles `dist/csa/` |
-| [`scripts/build_csa_venv_gateway.sh`](./datahub/scripts/build_csa_venv_gateway.sh) | Builds the venv **on the gateway**, against the node's own PyFlink |
-| [`scripts/submit_agent_csa.sh`](./datahub/scripts/submit_agent_csa.sh) | The submit path. Supports `DRY_RUN=1`. Heavily commented with the findings above |
-| [`examples/run_workflow_cluster_csa.py`](./datahub/examples/run_workflow_cluster_csa.py) | The job entry point |
-| [`patches/ratatoskr-runtime-csa-portability.patch`](./datahub/patches/ratatoskr-runtime-csa-portability.patch) | Makes the ratatoskr runtime `FLINK_HOME`-driven and adds the legacy-config fallback. Applies to `BrooksIan/FlinkDockerWithAgents`; the local Docker path is unchanged |
+Everything in `datahub/` is parameterized — no hostnames, usernames, or environment names are baked
+in. Cluster names appear only in `Verified on …` provenance comments. **None of the scripts take
+positional arguments**; all configuration is environment variables.
 
-The scripts are parameterized — no hostnames, usernames, or environment names baked in. Cluster names
-appear only in `Verified on …` provenance comments.
+| Path | Runs where | What it is |
+|---|---|---|
+| [`scripts/probe_csa_gateway.sh`](./datahub/scripts/probe_csa_gateway.sh) | gateway | Step 0's go/no-go probes, as one script |
+| [`deploy/Dockerfile.csa-build`](./datahub/deploy/Dockerfile.csa-build) | local (Docker) | `linux/amd64` build of the `flink-agents` 1.20 jars and wheel |
+| [`scripts/build_csa_bundle.sh`](./datahub/scripts/build_csa_bundle.sh) | local | Drives that build, assembles `dist/csa/` |
+| [`scripts/build_csa_venv_gateway.sh`](./datahub/scripts/build_csa_venv_gateway.sh) | gateway | Builds the venv against the node's own PyFlink |
+| [`scripts/submit_agent_csa.sh`](./datahub/scripts/submit_agent_csa.sh) | gateway | The submit path. Supports `DRY_RUN=1` |
+| [`examples/run_workflow_cluster_csa.py`](./datahub/examples/run_workflow_cluster_csa.py) | gateway (client) + cluster | The job entry point |
+| [`patches/ratatoskr-runtime-csa-portability.patch`](./datahub/patches/ratatoskr-runtime-csa-portability.patch) | local | Makes the ratatoskr runtime `FLINK_HOME`-driven and adds the legacy-config fallback. Applies to `BrooksIan/FlinkDockerWithAgents`; the local Docker path is unchanged |
+
+> **How to read the variable tables below.** A variable with a value in the *Default* column has a
+> literal `${VAR:-default}` fallback in the script. A variable marked **auto-detected** has **no**
+> default — the script discovers it at runtime and fails loudly if it cannot. That distinction
+> matters: do not assume `FLINK_HOME` is `/opt/flink` on a CSA node, because nothing in these scripts
+> ever says so. They resolve the real parcel path instead.
+
+### `scripts/probe_csa_gateway.sh`
+
+Read-only diagnostic. Run it **before building anything** — it is the cheapest way to find out that
+this whole approach is impossible on your cluster.
+
+```bash
+scp datahub/scripts/probe_csa_gateway.sh <user>@<gateway>:~/
+ssh <user>@<gateway> 'bash ~/probe_csa_gateway.sh' | tee csa-probe.txt
+```
+
+No environment variables, no arguments. It deliberately does **not** use `set -e`: every check is
+independent, so one failure does not hide the rest, and the script always exits 0. Read the output,
+don't check the exit code.
+
+It looks for the Flink parcel in three hardcoded locations —
+`/opt/cloudera/parcels/FLINK/lib/flink`, `/opt/cloudera/parcels/CSA/lib/flink`,
+`/opt/cloudera/parcels/FLINK-1.20.1/lib/flink`. If your parcel is elsewhere the parcel-dependent
+probes report nothing found; add your path to `PARCEL_CANDIDATES` at the top.
+
+**The one line that decides everything** is whether `$FLINK_HOME/lib/` contains a
+`flink-python-*.jar`. If it does not, the parcel has PyFlink stripped, there is no submit path, and
+you should go to the [CSA Operator path](./flink-agents-on-cdf-azure.md) instead.
+
+### `scripts/build_csa_bundle.sh`
+
+Runs **locally**. Builds the jars and wheel in a `linux/amd64` container, then assembles `dist/csa/`.
+
+```bash
+# first run — full Docker build, ~20 minutes
+datahub/scripts/build_csa_bundle.sh
+
+# every run after that — reassemble the agent code zip only, ~2 seconds
+SKIP_DOCKER=1 datahub/scripts/build_csa_bundle.sh
+```
+
+| Variable | Default | Notes |
+|---|---|---|
+| `PLATFORM` | `linux/amd64` | Do not change on an arm64 Mac — the wheel's native pieces must match the cluster |
+| `BASE_IMAGE` | `rockylinux/rockylinux:8` | Match your gateway's `/etc/os-release`, which Step 0 reported |
+| `FLINK_AGENTS_VERSION` | `release-0.3` | Git ref of `apache/flink-agents` |
+| `FLINK_MAJOR_MINOR` | `1.20` | Selects the `dist/flink-<minor>` module. **The submit script checks this against your cluster and refuses on mismatch** |
+| `FLINK_PATCH_VERSION` | `1.20.1` | Only the `apache-flink` pip pin *inside the build image*. See the note below |
+| `PYTHON_VERSION` | `3.11` | PyFlink 1.20 supports 3.8–3.11, **not** 3.12 |
+| `MAVEN_VERSION` | `3.9.9` | |
+| `IMAGE_TAG` | `ratatoskr-csa-build:${FLINK_MAJOR_MINOR}` | |
+| `SKIP_DOCKER` | `0` | `1` skips the build and only rebuilds `agentcode.zip` |
+
+`OUT_DIR` is fixed at `$REPO_ROOT/dist/csa` and is not overridable. Outputs land there:
+`jars/`, `agentenv.tar.gz`, `agentcode.zip`, `run_workflow_cluster_csa.py`,
+`submit_agent_csa.sh` (made executable), `BUILD-INFO.txt`, `site-packages-path.txt`.
+
+> **`FLINK_PATCH_VERSION` and `BUILD-INFO.txt` describe the build container, not your cluster.** This
+> variable feeds `pip install apache-flink==…` inside the image, which mattered only for the original
+> design — a full Python environment cross-built in Docker and shipped to the cluster. Step 0 killed
+> that design (the node already has a matched stack), and the gateway venv path ignores this value
+> entirely. So `BUILD-INFO.txt` saying `apache_flink=1.20.1` against a 1.20.5 cluster is not a bug and
+> is not the version you run — `submit_agent_csa.sh` resolves the real version from the parcel's
+> `flink-dist` jar at submit time. It is, however, genuinely confusing to read, which is the only
+> reason it is called out here.
+
+`agentenv.tar.gz` is likewise a leftover of the cross-built design. Nothing in the verified path ships
+it to the cluster.
+
+### `scripts/build_csa_venv_gateway.sh`
+
+Runs **on the gateway**, in a directory containing the `flink_agents-*.whl`. Creates a small venv with
+`--system-site-packages` so it *inherits* the node's already-matched PyFlink and pemja instead of
+reinstalling them — this is what replaced a 626 MB cross-built archive with a ~13 MB venv.
+
+```bash
+scp dist/csa/wheel/flink_agents-*.whl datahub/scripts/build_csa_venv_gateway.sh \
+    <user>@<gateway>:~/ratatoskr-csa/
+ssh <user>@<gateway>
+cd ~/ratatoskr-csa && ./build_csa_venv_gateway.sh
+```
+
+| Variable | Default | Notes |
+|---|---|---|
+| `VENV` | `agentvenv` | Directory name. **`rm -rf`'d and recreated** on every run |
+| `SYS_PY` | `/usr/bin/python3.11` | Must be the interpreter whose site-packages holds the node's PyFlink |
+| `ARCHIVE` | `agentvenv.tar.gz` | Tarball of the venv, written alongside it |
+| `STRIP_JARS` | `0` | `1` drops the wheel's bundled jars, ~230 MB → ~30 MB. Only safe once you are attaching jars explicitly |
+| `FLINK_HOME` | **auto-detected** | From the same parcel candidates as the probe |
+| `PIP_FIND_LINKS` / `PIP_NO_INDEX` | unset | For an air-gapped gateway: point at a local wheelhouse |
+
+`PIP_CONSTRAINT` and `PIP_BUILD_CONSTRAINT` are set internally to `/tmp/csa-constraint.txt` and are
+not user-overridable.
+
+It exits non-zero on seven distinct conditions, and each message says what to do:
+
+1. `$SYS_PY` is not executable.
+2. The **system** Python cannot import `apache-flink`, `pemja`, `apache-beam`, `numpy`, `pyarrow` or
+   `cloudpickle` — the node does not have the stack this design depends on.
+3. **Version skew**: the system `pemja` / `apache_flink` versions disagree with the parcel's jar
+   filenames. This is the check that catches a CSA upgrade out from under you.
+4. No `flink_agents-*.whl` in the current directory.
+5. `pip install` failed (the message includes the offline-wheelhouse fallback).
+6. The finished venv cannot import `pemja`, `pyflink`, `flink_agents`, `apache_beam`, `numpy`,
+   `pyarrow`, `pydantic`, or the expected `flink_agents.api.*` attributes.
+7. **`pyflink.__file__` does not resolve under `/usr/local`** — meaning pip shadowed the node's
+   PyFlink with its own copy. That silently reintroduces the version skew the whole approach exists to
+   avoid, so it is a hard failure rather than a warning.
+
+### `scripts/submit_agent_csa.sh`
+
+Runs **on the gateway**; `cd`s to its own directory, so it does not matter where you invoke it from.
+This is the only submit path, and it carries the findings from this runbook as inline comments.
+
+```bash
+cd ~/ratatoskr-csa
+DRY_RUN=1 ./submit_agent_csa.sh     # run all 18 checks, print the command, submit nothing
+./submit_agent_csa.sh               # submit
+```
+
+**Always run `DRY_RUN=1` first.** It performs every preflight check and assembles the full `flink run`
+command without submitting, which is how you confirm the `-yD` flags are present and the versions
+line up before spending a YARN allocation on it.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `VENV` | `agentvenv` | Must be the venv the previous script built |
+| `SYS_PY` | `/usr/bin/python3.11` | Must match the `SYS_PY` the venv was built against |
+| `ENTRY` | `run_workflow_cluster_csa.py` | The `-py` entry point. Change this to run a different agent |
+| `DRY_RUN` | `0` | `1` = check and print only |
+| `YARN_ATTEMPTS` | `2` | Becomes `-yD yarn.application-attempts` |
+| `KEYTAB` / `PRINCIPAL` | unset | Set **both** or neither. Required for anything long-running; the `kinit` cache is fine for a short job |
+| `JOB_NAME` | `ratatoskr-workflow-counter` | **Cosmetic — logging only.** See the warning below |
+| `FLINK_HOME` | **auto-detected** | From the parcel candidates |
+| `FLINK_CONF_DIR` | **auto-detected** | From `/etc/flink/conf`, then `/etc/flink/conf.cloudera.flink`. Mandatory — without it `flink run` gets none of CM's configuration |
+| `HADOOP_CONF_DIR` | `/etc/hadoop/conf` | |
+| `HADOOP_CLASSPATH` | **derived** | From `$(hadoop classpath)` |
+| `ARCHIVE` | `agentvenv.tar.gz` | Vestigial — nothing is shipped via HDFS any more |
+| `FLINK_USER_CLASSPATH` | internal | Fallback only |
+
+> **`JOB_NAME` does not name your YARN application.** In `yarn-per-job` mode
+> `YarnClusterDescriptor.deployJobCluster` hardcodes the application name to `"Flink per-job
+> cluster"`, and `yarn.application.name` is ignored. Never grep `yarn application -list` for your job
+> name — it will never be there. The script prints the correct `grep 'Flink per-job cluster'` command
+> for you.
+
+It exports `RATATOSKR_SITE_PACKAGES`, `PYFLINK_CLIENT_EXECUTABLE` and `PYTHONPATH`, builds
+`pyfs/{client,payload}/` and the flat `pyfs/agentcode.zip` (see the flat-layout trap above), then
+submits. The payload adds `flink_agents`, `pydantic`, `pydantic_core`, `annotated_types`,
+`typing_inspection`, `docstring_parser`, `importlib_resources`, `packaging`, `yaml`, `_yaml`,
+`dotenv`, `kafka` and `google` from the venv, minus `flink_agents/lib` and `__pycache__`.
+
+Of its 18 preflight checks, the ones worth knowing about:
+
+- **No `flink-python*.jar` in the parcel** → stops with "no PyFlink support … Fall back to the CSA
+  Operator on AKS path." Same verdict as the probe, enforced at submit time.
+- **`pemja` / `apache_flink` mismatch between the parcel and the venv** → stops. The JNI bridge's two
+  halves must match.
+- **Bundle-vs-cluster Flink minor mismatch** → stops with the exact fix:
+  `Rebuild the JARS with: FLINK_MAJOR_MINOR=<cluster minor>`.
+- `KEYTAB` set without `PRINCIPAL`, or no Kerberos ticket and no keytab and `DRY_RUN=0` → stops.
+- Missing `agentcode.zip` or `jars/` → stops.
+- A **non-fatal warning** if `add-opens=java.base/java.net` is absent from the Flink config.
+
+On success it prints the two commands you actually need next:
+
+```bash
+yarn application -list | grep 'Flink per-job cluster'
+yarn logs -applicationId <appId> | grep doubled
+```
+
+### `examples/run_workflow_cluster_csa.py`
+
+The `-py` entry point, and the thing to copy when you want to run your own agent. It runs in two
+places: the bootstrap and preflight execute **client-side on the gateway** when `flink run` compiles
+the job graph, and the graph `main()` builds executes **distributed on the TaskManagers**.
+
+The agent itself is deliberately trivial — `from_collection([5, 10, 15])` → `apply(CounterAgent())` →
+`print()`, no Kafka and no LLM — because the risk in this exercise is entirely in the deployment, and
+a job with dependencies of its own would only obscure whether the deployment worked.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `RATATOSKR_SITE_PACKAGES` | **self-derived** | From `Path(flink_agents.__file__).resolve().parent.parent` when unset. `submit_agent_csa.sh` exports it |
+
+`_bootstrap()` searches `here`, `here.parent` and `here.parent.parent` for a `ratatoskr/` package, so
+the file works both inside the repo and inside the shipped bundle. Two preflights raise `SystemExit`:
+
+- `$FLINK_HOME/lib` is not a directory.
+- `flink_agents_jar_uris(pipeline=False)` returned nothing → *"No Flink Agents jars for Flink
+  {major} under {SITE_PACKAGES}"*, i.e. the wheel's bundled jars are missing or the minor is wrong.
+
+**Do not run it standalone with plain `python`.** It has no `AgentsExecutionEnvironment` outside a
+`flink run` invocation, and the failure is confusing rather than informative.
+
+To adapt it for your own agent, keep the bootstrap and both preflights, keep the single `add_jars(*uris)`
+call (that one call is what keeps pemja in a single classloader — see the trap list), and replace only
+the source, the agent, and the sink. Then submit it with `ENTRY=my_agent.py ./submit_agent_csa.sh`.
+
+### End to end, in order
+
+```bash
+# local
+datahub/scripts/build_csa_bundle.sh
+
+# gateway — probe first, it can save you a day
+scp datahub/scripts/probe_csa_gateway.sh <user>@<gateway>:~/
+ssh <user>@<gateway> 'bash ~/probe_csa_gateway.sh' | tee csa-probe.txt
+
+# gateway — build the venv, then submit
+scp -r dist/csa/ datahub/scripts/build_csa_venv_gateway.sh <user>@<gateway>:~/ratatoskr-csa/
+ssh <user>@<gateway>
+kinit <workload-user>
+cd ~/ratatoskr-csa
+./build_csa_venv_gateway.sh
+DRY_RUN=1 ./submit_agent_csa.sh
+./submit_agent_csa.sh
+yarn application -list | grep 'Flink per-job cluster'
+yarn logs -applicationId <appId> | grep doubled
+```
 
 ## References
 
