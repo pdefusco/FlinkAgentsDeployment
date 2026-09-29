@@ -291,7 +291,14 @@ Every ReAct runbook is **human-in-the-loop**. The agent proposes the action and 
 
 ## Running on a CSA Data Hub instead of your own operator
 
-If you would rather not run the operator yourself, provision a **Streaming Analytics Data Hub** in your CDP environment and use its Flink cluster as the substrate. Build the same agents artifacts and submit the agent jobs to the Data Hub's Flink cluster instead of a FlinkDeployment in your AKS. You trade operator-level control over the image, Flink version, and sizing for a Cloudera-managed cluster. Check the Data Hub's Flink version against the Flink Agents 1.20.3 floor before you commit to this path. The operator route above lets you pin `flink:1.20.5-java17` directly, which is why it is the recommended one.
+If you would rather not run the operator yourself, provision a **Streaming Analytics Data Hub** in your CDP environment and submit the agent jobs to its Flink cluster on YARN instead of to a FlinkDeployment in your AKS. You trade operator-level control over the image, Flink version and sizing for a Cloudera-managed cluster.
+
+**That path is written up in full in [`flink-agents-on-csa-datahub.md`](./flink-agents-on-csa-datahub.md)** — verified end to end on CSA 1.18.0.0 / Flink 1.20.5, with the build, the submit command, and the traps. Read it before you commit to the route, because two things there are decisive:
+
+- **PyFlink on CSA is outside Cloudera support.** "Virtual environments for Python" is on the CSA unsupported-features list. The operator route above is the supported one.
+- **You need SSH access to the Data Hub gateway.** Without it, there is no submit path.
+
+The operator route lets you pin `flink:1.20.5-java17` directly and is supported, which is why it remains the recommended one.
 
 ---
 

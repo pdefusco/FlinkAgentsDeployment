@@ -1,0 +1,259 @@
+diff --git a/ratatoskr/runtime/flink_agents_bootstrap.py b/ratatoskr/runtime/flink_agents_bootstrap.py
+index c35bcc4e..97eeb653 100644
+--- a/ratatoskr/runtime/flink_agents_bootstrap.py
++++ b/ratatoskr/runtime/flink_agents_bootstrap.py
+@@ -23,8 +23,95 @@ def patch_flink_agents_version() -> None:
+     patch_flink_agents_jar_loading()
+ 
+ 
++def patch_flink_agents_config_loading() -> None:
++    """Stop Flink Agents crashing on Flink's *legacy* ``flink-conf.yaml`` format.
++
++    ``RemoteExecutionEnvironment.__load_config_from_flink_conf_dir`` reads
++    ``$FLINK_CONF_DIR/flink-conf.yaml`` and hands it to ``yaml.safe_load``. That is an
++    upstream bug: Flink has **two** config formats, and only the newer ``config.yaml`` is
++    real YAML. The legacy ``flink-conf.yaml`` is a flat ``key: value`` file parsed by a
++    hand-rolled line splitter in ``GlobalConfiguration``, and it is *not* required to be
++    valid YAML. Cloudera CSA ships the legacy format, so on CSA this raises::
++
++        yaml.scanner.ScannerError: while scanning for the next token
++        found character '%' that cannot start any token
++          in "/etc/flink/conf/flink-conf.yaml", line 49, column 40
++
++    Line 49 is ``yarn.container-start-command-template``, whose value contains Flink's own
++    ``%java% %jvmmem% %jvmopts%`` placeholders. A bare ``%`` cannot start a YAML token.
++
++    The insult is that the parse is pointless here: ``load_from_file`` only keeps
++    ``raw_config.get("agent", {})``, and CSA's config has no ``agent`` keys at all — so
++    the correct result is an empty dict, and the crash is pure collateral damage.
++
++    Note this bug is *reachable only because* ``FLINK_CONF_DIR`` is now set. The loader
++    returns early when it is unset, which is why earlier submissions never got here.
++    Unsetting it is not an option — the parcel's shell scripts, ``--add-opens``, and every
++    YARN/HA/security default depend on it (see ``scripts/submit_agent_csa.sh``).
++
++    The patch parses both formats and keeps the ``agent.*`` keys either way. It only
++    changes behaviour when ``yaml.safe_load`` *fails*, so the Docker path — whose
++    ``/opt/flink/conf`` config does parse as YAML — is byte-for-byte unchanged.
++    """
++    try:
++        from flink_agents.plan import configuration as cfg
++    except ImportError:
++        return
++    if getattr(cfg, "_RATATOSKR_CONFIG_PATCH", False):
++        return
++
++    # ``Configuration`` is only the ABC; the implementation lives on
++    # ``AgentConfiguration(BaseModel, Configuration)``. Check ``vars(cls)`` rather than
++    # ``hasattr`` so an inherited abstract stub is not mistaken for the real method.
++    target = None
++    for name in ("AgentConfiguration", "Configuration"):
++        cls = getattr(cfg, name, None)
++        if cls is not None and "load_from_file" in vars(cls):
++            target = cls
++            break
++    if target is None:
++        return
++
++    _original_load = target.load_from_file
++
++    def _patched_load_from_file(self, config_path=None):
++        try:
++            return _original_load(self, config_path)
++        except Exception:
++            pass
++        if not config_path:
++            return None
++
++        # Legacy fallback: flat "key: value" lines, splitting on the FIRST colon only,
++        # because values routinely contain colons (URIs, java opts, ZK quorums).
++        from pathlib import Path
++
++        agent_conf: dict[str, str] = {}
++        try:
++            for raw_line in Path(config_path).read_text().splitlines():
++                line = raw_line.strip()
++                if not line or line.startswith("#") or ":" not in line:
++                    continue
++                key, _, value = line.partition(":")
++                key = key.strip()
++                if key.startswith("agent."):
++                    agent_conf[key[len("agent.") :]] = value.strip()
++        except OSError:
++            return None
++
++        self.conf_data.update(agent_conf)
++        return None
++
++    target.load_from_file = _patched_load_from_file
++    cfg._RATATOSKR_CONFIG_PATCH = True
++
++
+ def patch_flink_agents_jar_loading() -> None:
+     """Skip duplicate per-jar ``add_jars`` calls from Flink Agents (Pemja classloaders)."""
++    # Must be installed before create_instance() below, which is what triggers the
++    # FLINK_CONF_DIR read. No-op wherever the config is valid YAML.
++    patch_flink_agents_config_loading()
++
+     try:
+         from flink_agents.api import execution_environment as ee
+     except ImportError:
+diff --git a/ratatoskr/runtime/flink_cluster_submit.py b/ratatoskr/runtime/flink_cluster_submit.py
+index b136a7d0..73bd27c7 100644
+--- a/ratatoskr/runtime/flink_cluster_submit.py
++++ b/ratatoskr/runtime/flink_cluster_submit.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ 
+ import json
+ import os
++import re
+ import subprocess
+ import time
+ import urllib.error
+@@ -16,16 +17,31 @@ import urllib.request
+ from pathlib import Path
+ from typing import Iterable, List, Optional, Sequence, Set
+ 
+-FLINK_LIB = Path("/opt/flink/lib")
+-FLINK_BIN = Path("/opt/flink/bin/flink")
+-SITE_PACKAGES = Path("/opt/flink/pythonpath/agent-site-packages")
+-FLINK_AGENTS_SRC = Path("/opt/flink/flink-agents")
++# Flink install root. Defaults to the Docker Compose image layout (``/opt/flink``);
++# override via ``FLINK_HOME`` for cluster deployments where Flink lives elsewhere
++# (e.g. a Cloudera CSA parcel at
++# ``/opt/cloudera/parcels/FLINK/lib/flink``). ``SITE_PACKAGES`` and
++# ``FLINK_AGENTS_SRC`` are separately overridable because on a parcel install the
++# Flink root is read-only, so the agent runtime has to live outside it.
++FLINK_HOME = Path(os.environ.get("FLINK_HOME") or "/opt/flink")
++FLINK_LIB = FLINK_HOME / "lib"
++FLINK_BIN = FLINK_HOME / "bin" / "flink"
++SITE_PACKAGES = Path(
++    os.environ.get("RATATOSKR_SITE_PACKAGES")
++    or FLINK_HOME / "pythonpath" / "agent-site-packages"
++)
++FLINK_AGENTS_SRC = Path(
++    os.environ.get("RATATOSKR_FLINK_AGENTS_SRC") or FLINK_HOME / "flink-agents"
++)
+ 
+-DEFAULT_PYTHONPATH = (
+-    "/opt/flink:"
+-    "/opt/flink/pythonpath/agent-site-packages:"
+-    "/opt/flink/opt/python/pyflink:"
+-    "/opt/flink/opt/python/py4j"
++DEFAULT_PYTHONPATH = os.pathsep.join(
++    str(p)
++    for p in (
++        FLINK_HOME,
++        SITE_PACKAGES,
++        FLINK_HOME / "opt" / "python" / "pyflink",
++        FLINK_HOME / "opt" / "python" / "py4j",
++    )
+ )
+ 
+ 
+@@ -36,13 +52,27 @@ def ensure_python_symlink() -> None:
+         subprocess.run(["ln", "-sf", str(python3), str(python)], check=False)
+ 
+ 
++# Matches the ``<major>.<minor>`` in a flink-dist jar name, tolerating an optional
++# Scala suffix and vendor qualifiers, e.g.::
++#     flink-dist-2.1.3.jar                            -> 2.1
++#     flink-dist-1.20.1.jar                           -> 1.20
++#     flink-dist_2.12-1.20.1-csa1.14.0.0-cdh7.3.2.jar -> 1.20
++# Naive prefix-stripping mis-parses the Scala-suffixed form that Cloudera parcels
++# may ship, yielding a bogus version that then corrupts every version-derived path.
++_FLINK_DIST_VERSION_RE = re.compile(r"flink-dist(?:_[\d.]+)?-(\d+)\.(\d+)")
++
++
+ def flink_major_version() -> str:
+-    jars = list(FLINK_LIB.glob("flink-dist-*.jar"))
++    jars = sorted(FLINK_LIB.glob("flink-dist*.jar"))
+     if not jars:
+         raise FileNotFoundError(f"No flink-dist jar in {FLINK_LIB}")
+-    version = jars[0].name.removeprefix("flink-dist-").removesuffix(".jar")
+-    parts = version.split(".")
+-    return ".".join(parts[:2])
++    for jar in jars:
++        match = _FLINK_DIST_VERSION_RE.search(jar.name)
++        if match:
++            return f"{match.group(1)}.{match.group(2)}"
++    raise ValueError(
++        f"Could not parse a Flink version from: {', '.join(j.name for j in jars)}"
++    )
+ 
+ 
+ def ensure_flink_agents_jars() -> None:
+@@ -113,7 +143,7 @@ def ensure_pemja_parent_classpath() -> None:
+     """
+     import shutil
+ 
+-    opt_dir = Path("/opt/flink/opt")
++    opt_dir = FLINK_HOME / "opt"
+     for jar in sorted(opt_dir.glob("flink-python-*.jar")):
+         target = FLINK_LIB / jar.name
+         if target.exists() and target.stat().st_size == jar.stat().st_size:
+@@ -183,11 +213,54 @@ def attach_flink_agents_jars(stream_env) -> None:
+     try:
+         stream_env.get_config().set("pipeline.jars", joined)
+     except Exception:
++        # Not available on every PyFlink: on 1.20 this raises AttributeError, because
++        # get_config() returns an ExecutionConfig with no .set(). add_jars below is what
++        # actually does the work; this is a no-op there, kept for versions where it helps.
+         pass
++
++    # add_jars is the load-bearing call, and its failure mode used to be invisible: this
++    # was `except Exception: pass`, which on CSA meant ZERO jars attached and a
++    # ClassNotFoundException hours later pointing nowhere near the cause. The specific
++    # trap: add_jars -> add_jars_to_context_class_loader reflects on
++    # URLClassLoader.addURL, which on Java 17 needs
++    # --add-opens=java.base/java.net=ALL-UNNAMED. CSA supplies that via env.java.opts.all
++    # in flink-conf.yaml, but ONLY if FLINK_CONF_DIR points at /etc/flink/conf — the
++    # parcel has no conf/ of its own, so an unset FLINK_CONF_DIR silently removes it.
++    #
++    # Still tolerate the exception rather than re-raising: on some versions the set()
++    # above has already done the job, so raising eagerly would break a working path.
++    # Instead verify the effective config and only fail if the jars really are absent.
++    add_jars_error: Exception | None = None
+     try:
+         stream_env.add_jars(*jar_uris)
++    except Exception as exc:
++        add_jars_error = exc
++    if add_jars_error is None:
++        return
++
++    try:
++        from pyflink.util.java_utils import get_j_env_configuration
++
++        effective = get_j_env_configuration(
++            stream_env._j_stream_execution_environment
++        ).getString("pipeline.jars", "")
+     except Exception:
+-        pass
++        # Cannot verify — preserve the old tolerant behaviour rather than guessing.
++        return
++
++    import os
++
++    if all(os.path.basename(uri) in effective for uri in jar_uris):
++        return
++    raise RuntimeError(
++        "Failed to attach the Flink Agents jars to pipeline.jars: "
++        f"{type(add_jars_error).__name__}: {add_jars_error}\n"
++        f"Wanted: {joined}\nEffective pipeline.jars: {effective!r}\n"
++        "If this is an InaccessibleObjectException about java.net, FLINK_CONF_DIR is "
++        "probably unset, so --add-opens=java.base/java.net=ALL-UNNAMED from "
++        "flink-conf.yaml never reached the JVM. On a CM-managed parcel install set:\n"
++        "  export FLINK_CONF_DIR=/etc/flink/conf"
++    ) from add_jars_error
+ 
+ 
+ PEMJA_VERSION = "pemja>=0.6.0,<0.7.0"
+@@ -425,7 +498,7 @@ def flink_run_py(
+ 
+     result = subprocess.run(
+         cmd,
+-        cwd="/opt/flink",
++        cwd=str(FLINK_HOME),
+         env=run_env,
+         capture_output=True,
+         text=True,
