@@ -314,10 +314,26 @@ and it removed the single largest source of risk in the whole exercise:
 > where the only way to test it is to submit a job.
 
 **Matching the Flink minor is not enough — the Python stack must match the cluster's patch version.**
-That is a much easier thing to get wrong than it sounds, because every jar and module in this project
-is selected by minor (`dist/flink-1.20`) and nothing about a `1.20` bundle warns you that its pemja
-belongs to a different `1.20.x`. Building on the gateway against the node's own stack sidesteps the
-question entirely, which is why that is the live path.
+The pin moves on nearly every patch release of 1.20.x, into bands that do not overlap (upstream PyPI
+metadata, checked 2026-09-29):
+
+| `apache-flink` | pemja pin |
+|---|---|
+| 1.20.1 | `pemja==0.4.1` |
+| 1.20.2 | `pemja==0.4.1` |
+| 1.20.3 | `pemja>=0.5.5,<0.5.6` |
+| 1.20.4 | `pemja>=0.5.6,<0.5.7` |
+| 1.20.5 | `pemja>=0.5.7,<0.5.8` |
+
+Because the bands are mutually exclusive, **any** patch-version mismatch other than 1.20.1 ↔ 1.20.2
+guarantees a pemja mismatch rather than merely risking one. And it is an easy thing to get wrong,
+because every jar and module in this project is selected by *minor* (`dist/flink-1.20`) and nothing
+about a `1.20` bundle warns you that its pemja belongs to a different `1.20.x`.
+
+Two consequences worth planning for. A CSA upgrade that moves only the patch version will break a
+pinned bundle — which is what the parcel-versus-venv check in `submit_agent_csa.sh` exists to catch.
+And building on the gateway against the node's own stack sidesteps the question entirely, which is why
+that is the live path.
 
 ---
 
