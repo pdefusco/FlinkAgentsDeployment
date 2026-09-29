@@ -346,6 +346,24 @@ The decisive check is whether the Flink parcel ships `flink-python-*.jar` in `$F
 it does not, PyFlink was stripped and there is no path — go to the Operator model.
 [Step 0](./flink-agents-on-csa-datahub.md#step-0-probe-the-cluster-before-building-anything).
 
+**Then probe the workers**, because the gateway is not where the job runs — and ssh from the gateway to
+the workers is refused, so the only way in is a YARN container:
+
+```bash
+scp datahub/scripts/probe_csa_workers.sh <os-user>@<gateway>:~/
+ssh <os-user>@<gateway>
+kinit <workload-user>
+DRY_RUN=1 bash ~/probe_csa_workers.sh    # show the plan first
+bash ~/probe_csa_workers.sh
+```
+
+This is the **one script here that is not read-only**: it submits a short distributed-shell application
+(one container per worker, ~30–60 s, self-terminating), so confirm with the cluster owner. It prints a
+per-node verdict and exits non-zero unless every worker reports `READY`. It matters because the next step
+deliberately stops shipping a Python interpreter with the job and relies on the one already installed on
+each node — if that is missing on even one worker, jobs fail *intermittently*, only when a TaskManager
+lands there. [Step 0b](./flink-agents-on-csa-datahub.md#step-0b-prove-the-workers-not-just-the-gateway).
+
 **Build the jars and wheel locally,** in a `linux/amd64` container (cluster nodes are x86_64; an
 Apple Silicon Mac must cross-build or pemja's compiled extension is the wrong architecture):
 
@@ -457,6 +475,7 @@ And the flag syntax, one more time, because it costs more time than anything els
 | [`flink-agents-on-csa-datahub.md`](./flink-agents-on-csa-datahub.md) | Data Hub runbook: AWS + CDP infra from scratch, build, submit, every trap found |
 | [`flink-agents-on-cdf-azure.md`](./flink-agents-on-cdf-azure.md) | Operator runbook: Azure + AKS infra from scratch, image build, `FlinkDeployment`, DataFlow and AI Inference integration |
 | [`datahub/scripts/probe_csa_gateway.sh`](./datahub/scripts/probe_csa_gateway.sh) | Go/no-go probes. **Run this first** — it can kill the approach in ten minutes |
+| [`datahub/scripts/probe_csa_workers.sh`](./datahub/scripts/probe_csa_workers.sh) | Verifies the PyFlink runtime on **every worker**, inside a real YARN container. The only script here that submits an application |
 | [`datahub/scripts/build_csa_bundle.sh`](./datahub/scripts/build_csa_bundle.sh) | Builds the Flink Agents jars + wheel (local, `linux/amd64`) |
 | [`datahub/scripts/build_csa_venv_gateway.sh`](./datahub/scripts/build_csa_venv_gateway.sh) | Builds the Python env **on the gateway**, against the node's own PyFlink |
 | [`datahub/scripts/submit_agent_csa.sh`](./datahub/scripts/submit_agent_csa.sh) | The submit path. `DRY_RUN=1` prints the command without submitting |

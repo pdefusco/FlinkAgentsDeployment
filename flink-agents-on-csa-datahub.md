@@ -305,10 +305,63 @@ from the parcel and no amount of client-side work will recover it. Go to the ope
 [`datahub/scripts/probe_csa_gateway.sh`](./datahub/scripts/probe_csa_gateway.sh) runs all of this and
 prints a summary.
 
+### Step 0b. Prove the *workers*, not just the gateway
+
+Everything above runs on the gateway. **The gateway is not where the job runs**, and on this path that
+distinction decides whether the design below is sound: the whole `--system-site-packages` approach, and
+the decision to stop shipping an interpreter archive with `-pyarch` at all, rests on the claim that
+*every* node already carries Cloudera's matched PyFlink stack. If that is false on one worker, jobs fail
+**intermittently** — they succeed whenever the TaskManagers happen to avoid that node — which is the
+worst failure mode to debug of anything in this document.
+
+You cannot check it the obvious way. **On a CDP Data Hub, ssh from the gateway to the worker nodes is
+refused.** And the site-packages directory in question is populated by a Cloudera service recipe rather
+than owned by an rpm, so it is not guaranteed identical across instance groups and `rpm -q` cannot
+answer the question at all.
+
+**A YARN distributed-shell application is the way in.** It runs a script inside a real container on real
+worker nodes — the same execution context a TaskManager gets — so it proves the library is *importable
+there*, not merely present on some disk.
+
+```bash
+scp datahub/scripts/probe_csa_workers.sh <os-user>@<gateway>:~/
+ssh <os-user>@<gateway>
+kinit <workload-user>
+DRY_RUN=1 bash ~/probe_csa_workers.sh              # show the plan and the probe, submit nothing
+bash ~/probe_csa_workers.sh | tee csa-workers.txt
+```
+
+> **Unlike every other script here, this one is not read-only.** It submits a real YARN application —
+> one container per worker, ~30–60 s, self-terminating, appearing as a normal FINISHED/SUCCEEDED app.
+> It writes nothing on any node outside the containers' working directories and YARN's staging dir under
+> your HDFS home. Cheap and harmless, but it *is* a submission to a shared scheduler: run `DRY_RUN=1`
+> first and confirm with the cluster owner.
+
+It ends with a per-node verdict and exits non-zero unless every worker answered `READY`:
+
+```
+========== SUMMARY ==========
+    pdf-pwc-worker0              READY
+    pdf-pwc-worker1              READY
+    pdf-pwc-worker2              READY
+
+    nodes that answered: 3 of 3 RUNNING NodeManagers
+```
+
+**The one thing to know before you tune it: container size decides coverage, and partial coverage looks
+exactly like success.** With small containers YARN packs every one of them onto a single node — three
+separate runs here at 256 MB, 1024 MB and 4915 MB all landed entirely on `worker1`, verifying one node
+three times. The script derives `-container_memory` from the *measured* node capacity so that each
+container is larger than half a node and co-location is arithmetically impossible, then checks how many
+distinct hostnames actually answered and **fails on partial coverage** rather than reporting a pass.
+Details, and the other three traps, are in
+[`scripts/probe_csa_workers.sh`](#scriptsprobe_csa_workerssh).
+
 ### What Step 0 found, and why it changed everything
 
 **CSA nodes already ship a complete, matched, pip-installed PyFlink stack.** Verified on the gateway
-*and* independently on all three workers:
+with `probe_csa_gateway.sh`, *and* independently on all three workers inside real YARN containers with
+[Step 0b](#step-0b-prove-the-workers-not-just-the-gateway):
 
 ```
 /usr/local/lib64/python3.11/site-packages     (installed by Cloudera, not rpm-owned)
@@ -591,9 +644,12 @@ State this plainly to anyone who asks to run it in production:
   password.** Keep that file, and any dump of the JobManager's JVM options, out of runbooks, pastes,
   screenshots and commits. If you must show JVM options, redact with an **allow-list** (print only
   the keys you intend to show) — a deny-list `sed` will mask the paths and leak the values.
-- The gateway's `cloudbreak` user has passwordless `sudo`. Nothing in this runbook needs it. None of
-  this work modified, installed, or wrote anything on any cluster node — every cluster file was read
-  only.
+- The gateway's `cloudbreak` user has passwordless `sudo`. Nothing in this runbook needs it, and nothing
+  here modified, installed, or wrote any **cluster** file — every cluster file was read only. Two things
+  do put load on the cluster, and both are submissions rather than modifications:
+  `submit_agent_csa.sh` runs your job, and `probe_csa_workers.sh` runs a short distributed-shell app.
+  Both write only into their own YARN containers and the staging dir under your HDFS home. Everything
+  else in `datahub/` is read-only.
 
 ## Script reference
 
@@ -604,6 +660,7 @@ positional arguments**; all configuration is environment variables.
 | Path | Runs where | What it is |
 |---|---|---|
 | [`scripts/probe_csa_gateway.sh`](./datahub/scripts/probe_csa_gateway.sh) | gateway | Step 0's go/no-go probes, as one script |
+| [`scripts/probe_csa_workers.sh`](./datahub/scripts/probe_csa_workers.sh) | gateway → **workers** | Step 0b. Verifies the PyFlink stack on every worker inside a real YARN container. **Submits a YARN app** |
 | [`deploy/Dockerfile.csa-build`](./datahub/deploy/Dockerfile.csa-build) | local (Docker) | `linux/amd64` build of the `flink-agents` 1.20 jars and wheel |
 | [`scripts/build_csa_bundle.sh`](./datahub/scripts/build_csa_bundle.sh) | local | Drives that build, assembles `dist/csa/` |
 | [`scripts/build_csa_venv_gateway.sh`](./datahub/scripts/build_csa_venv_gateway.sh) | gateway | Builds the venv against the node's own PyFlink |
@@ -639,6 +696,87 @@ probes report nothing found; add your path to `PARCEL_CANDIDATES` at the top.
 **The one line that decides everything** is whether `$FLINK_HOME/lib/` contains a
 `flink-python-*.jar`. If it does not, the parcel has PyFlink stripped, there is no submit path, and
 you should go to the [CSA Operator path](./flink-agents-on-cdf-azure.md) instead.
+
+### `scripts/probe_csa_workers.sh`
+
+Runs **on the gateway**, and answers a question about the **workers**: is the node-provided PyFlink
+stack present and importable *where the job actually executes*? Run it once per cluster, after
+`probe_csa_gateway.sh` and before trusting the `--system-site-packages` design.
+
+```bash
+scp datahub/scripts/probe_csa_workers.sh <os-user>@<gateway>:~/
+ssh <os-user>@<gateway>
+kinit <workload-user>
+DRY_RUN=1 bash ~/probe_csa_workers.sh        # sizing plan + the exact probe, submits nothing
+bash ~/probe_csa_workers.sh | tee csa-workers.txt
+```
+
+**It is not read-only.** It submits a YARN distributed-shell application — one container per RUNNING
+NodeManager, `-timeout 300000`, self-terminating in ~30–60 s. Nothing is written on any node beyond the
+containers' own working directories and YARN's staging dir under your HDFS home; the temp probe file on
+the gateway is removed by an `EXIT` trap. Still: confirm with the cluster owner, and use `DRY_RUN=1`
+first. Kerberos is required (checked up front, because a missing ticket otherwise surfaces as an opaque
+GSS error several seconds into the submit) — `DRY_RUN=1` works without one.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `SYS_PY` | `/usr/bin/python3.11` | **Must match** the `SYS_PY` used by `build_csa_venv_gateway.sh` and `submit_agent_csa.sh`, or this verifies the wrong interpreter. The libpython check derives its version from this value |
+| `PKGS` | `apache-flink apache-flink-libraries apache-beam pemja numpy pyarrow pandas` | Reported per node with versions. Add to it; don't trim it |
+| `NUM_CONTAINERS` | **one per RUNNING node** | Raising it above the node count only verifies some node twice |
+| `CONTAINER_MEMORY` | **derived** | `min(node capacity) × MEM_FRACTION`, then clamped to `capacity − MASTER_MEMORY` and to `yarn.scheduler.maximum-allocation-mb`. Setting it by hand overrides the anti-co-location arithmetic — see below |
+| `MEM_FRACTION` | `0.6` | **Keep it above 0.5.** This is the whole coverage mechanism |
+| `MASTER_MEMORY` | `512` | The AM occupies a container on one of the same nodes; this is the room left for it |
+| `PROBE_TIMEOUT_MS` | `300000` | Passed as `-timeout`, so a wedged app cannot sit on the scheduler |
+| `LOG_RETRIES` / `LOG_RETRY_SLEEP` | `6` / `10` | Log aggregation completes slightly *after* the app does; the first `yarn logs` can legitimately come back empty |
+| `DS_JAR` | **auto-detected** | `hadoop-yarn-applications-distributedshell*.jar` from the CDH parcel. Pass it explicitly if your layout differs |
+| `YARN_SITE` | `/etc/hadoop/conf/yarn-site.xml` | Read only for `maximum-allocation-mb` |
+| `APP_NAME` | `csa_worker_probe` | What the cluster owner will see in the RM UI |
+| `DRY_RUN` | `0` | `1` = print the plan and the generated probe, submit nothing |
+| `KEEP_TMP` | `0` | `1` keeps the generated probe script for inspection |
+
+Exit codes are meaningful here, unlike the gateway probe:
+
+| | |
+|---|---|
+| `0` | Every worker answered, and every one reported `READY` |
+| `1` | A node reported `INCOMPLETE`, **or** fewer nodes answered than there are NodeManagers |
+| `2` | The app ran but no `PROBE[...]` lines reached the aggregated logs — read `yarn logs -applicationId <id>` yourself |
+
+**Why the container sizing is calculated rather than defaulted.** This is the finding that makes the
+script worth having, and it cost three wasted runs:
+
+1. **A container must be larger than half a node, or YARN packs them all onto one host.** Runs at
+   256 MB, 1024 MB and 4915 MB against 21504 MB nodes each landed entirely on `worker1` — verifying one
+   node three times while the output looked like full coverage. With `-num_containers 3` and
+   `-container_memory 12902`, co-location is arithmetically impossible and all three nodes answer in
+   one run.
+2. **Parse the capacity by label.** `yarn node -status` prints `Memory-Used : 0MB` *before*
+   `Memory-Capacity : 21504MB`, so the tempting `grep -oE '[0-9]+MB' | head -1` silently yields `0` and
+   every derived size is nonsense. That wrong parse is what caused (1).
+3. **Prefix every output line with the hostname, inside the container.** Otherwise identical results
+   from different nodes are indistinguishable, `sort -u` collapses them into a single block, and one
+   node's answer reads as the whole cluster's. Every line carries `PROBE[<host>]`, which is also what
+   makes the coverage count and the per-node verdict table possible.
+4. **`-shell_script`, not `-shell_command`.** Quoting a multi-line Python heredoc through
+   `-shell_command` is unusable.
+
+If the cluster is busy the script says so and the app *waits* for room rather than failing. If
+`yarn.scheduler.maximum-allocation-mb` is lower than half a node, it warns that spread is no longer
+guaranteed — in that case read the per-node table rather than trusting the verdict.
+
+**A `READY` verdict does not prove the JNI layer loads.** The probe imports `pemja`, never `pemja_core`:
+`pemja_core` is the JNI half and importing it from a plain CPython process *always* fails with
+`undefined symbol: JNI_GetCreatedJavaVMs`, because the JVM supplies that symbol. Only a running
+TaskManager can prove that half. What `READY` does establish — and what was previously unknown — is that
+the Python halves are installed, version-matched, and importable under the container's own environment
+on every worker.
+
+**What has actually been run, precisely.** The *findings* in [Step 0b](#step-0b-prove-the-workers-not-just-the-gateway)
+are from the live `pdf-pwc` cluster — an ad-hoc version of this probe really did run under
+distributed-shell on all three workers. The *script* is the formalization of that run, and has so far
+been exercised only against stubbed `yarn node -list` / `-status` / `logs` output (the parse, the sizing
+arithmetic, both clamps, the coverage count, all three exit codes). It has not yet been run end to end
+on a live cluster as written. Run it with `DRY_RUN=1` first and read the numbers it derives.
 
 ### `scripts/build_csa_bundle.sh`
 
@@ -825,8 +963,15 @@ the source, the agent, and the sink. Then submit it with `ENTRY=my_agent.py ./su
 datahub/scripts/build_csa_bundle.sh
 
 # gateway — probe first, it can save you a day
-scp datahub/scripts/probe_csa_gateway.sh <user>@<gateway>:~/
+scp datahub/scripts/probe_csa_gateway.sh datahub/scripts/probe_csa_workers.sh <user>@<gateway>:~/
 ssh <user>@<gateway> 'bash ~/probe_csa_gateway.sh' | tee csa-probe.txt
+
+# workers — verify the runtime where the job will actually run (submits a short YARN app)
+ssh <user>@<gateway>
+kinit <workload-user>
+DRY_RUN=1 bash ~/probe_csa_workers.sh
+bash ~/probe_csa_workers.sh | tee csa-workers.txt
+exit
 
 # gateway — build the venv, then submit
 scp -r dist/csa/ datahub/scripts/build_csa_venv_gateway.sh <user>@<gateway>:~/ratatoskr-csa/
