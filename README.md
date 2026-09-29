@@ -317,10 +317,62 @@ ratatoskr agent submit my_agent
 > `ratatoskr agent submit`, and cannot be carried onto CSA by Part 4 without hand-writing a cluster
 > script for it first. Use the Designer to explore; hand-write what you intend to deploy.
 
+#### Carrying a Designer-authored agent to CSA
+
+If you did author in the Designer, the agent needs one more step before Part 3 — and **nothing warns
+you**, in either direction. What the Designer writes is not a module but a *shim*:
+`examples/agents/published_shims/<name>.py` computes `parents[3]` and loads the real class from
+`.ratatoskr/agents/<def_id>/agent.py`. Two independent consequences:
+
+- **The bundler deletes it deliberately.** `build_csa_bundle.sh` does `rm -rf .../published_shims` when
+  assembling `agentcode.zip`, so the agent never reaches the cluster at all.
+- **Even shipped, it could not import.** `.ratatoskr/` is local Designer state — gitignored, and absent
+  on every YARN node. The generated `cluster_import.py` sibling falls back to `/opt/flink/.ratatoskr/…`,
+  which is the *Docker* image layout, not YARN's. Both branches raise at module-import time.
+
+The fix is a copy, because generated `agent.py` files import only `flink_agents.api.*` and are
+self-contained:
+
+```bash
+cp .ratatoskr/agents/<def_id>/agent.py examples/agents/my_agent.py
+```
+
+Find `<def_id>` in the shim's `_DEFINITION_ID`. That turns it into an ordinary module, which
+`build_csa_bundle.sh` then picks up with everything else in `examples/agents/*.py`. Import the class by
+its real name — the Designer suffixes it, so `my_test_agent` yields `MyTestAgentAgent` — then write the
+cluster entry script as in Part 4. Confirm it actually made it:
+
+```bash
+unzip -l dist/csa/agentcode.zip | grep my_agent     # must print something
+```
+
+Being a copy rather than a link, it is now a fork: later Designer edits do **not** reach the cluster
+copy. Re-copy after each change, or treat the flattened module as the source of truth from then on.
+
 ### Part 3. Build the runtime on the existing CSA Data Hub cluster
 
 This is the part that is genuinely hard, and it is **per cluster, not per agent** — do it once, then
 Part 4 is cheap and repeatable. Full detail in the runbook; the shape of it:
+
+> **Run every command in this Part on your own machine — not inside the Flink containers.** Worth
+> stating because Parts 1 and 2 are the opposite: there, the runtime work happens *in* the jobmanager
+> container. Three prompts are in play from here on:
+>
+> | Where | What runs there |
+> |---|---|
+> | **your machine (host)** | All of Part 3: `docker build` via `build_csa_bundle.sh`, every `scp`/`ssh`, and the Designer itself (`ratatoskr api` is a host uvicorn process, which is why `.ratatoskr/` is at the repo root) |
+> | **the gateway** | `probe_csa_gateway.sh`, `probe_csa_workers.sh`, `build_csa_venv_gateway.sh`, and Part 4's submit |
+> | **the jobmanager container** | Nothing in Part 3. This is Part 1's `ratatoskr agent submit` path |
+>
+> `deploy/docker-compose.yml` declares **no volume mounts and no Docker socket**, so the containers
+> cannot see your repo (`ratatoskr agent submit` copies files in), cannot invoke `docker build`, and hold
+> neither your SSH key nor the `cdp` CLI. `dist/csa/` must exist on the host regardless — it is what you
+> `scp` from.
+>
+> The one thing that genuinely **cannot** run on the host is `import flink_agents` / `import pyflink`:
+> that wheel is installed only into `agent_flink_image`, never into your virtualenv (see Part 1). So
+> verify agent *code* in-container with `ratatoskr agent submit`, and build and ship the bundle from the
+> host. Mixing those up is the most common way to lose an hour here.
 
 > **Two different usernames are in play — this catches everyone once.**
 >

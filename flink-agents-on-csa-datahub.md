@@ -431,6 +431,36 @@ Two things in that Dockerfile are load-bearing and easy to lose: `SKIP_SPOTLESS_
 `SKIP_DOCKER=1 scripts/build_csa_bundle.sh` reassembles only the agent-code zip, which is what you
 want on every iteration after the first.
 
+### Step 1b. If the agent came from the Designer, flatten it first
+
+`build_csa_bundle.sh` ships every `examples/agents/*.py`, so a hand-written agent needs nothing here. A
+**Designer-published** agent needs one step, and skipping it fails in a way that points nowhere near the
+cause.
+
+What the Designer writes into `examples/agents/published_shims/<name>.py` is a loader, not the agent: it
+resolves `parents[3]` and `exec`s `.ratatoskr/agents/<def_id>/agent.py`. So it breaks twice over.
+
+| | |
+|---|---|
+| The bundler **drops it on purpose** | `rm -rf "$STAGE/examples/agents/published_shims"` — the agent is simply not in `agentcode.zip`, and the submit succeeds while running something else |
+| It could not import anyway | `.ratatoskr/` is gitignored local Designer state, absent on every YARN node. The generated `cluster_import.py` falls back to `/opt/flink/.ratatoskr/…`, the *Docker image* layout — on YARN neither path exists, and the failure is at module-import time inside a TaskManager |
+
+Generated `agent.py` files import only `flink_agents.api.*`, so flattening is a copy:
+
+```bash
+cp .ratatoskr/agents/<def_id>/agent.py examples/agents/my_agent.py   # <def_id> = the shim's _DEFINITION_ID
+SKIP_DOCKER=1 scripts/build_csa_bundle.sh
+unzip -l dist/csa/agentcode.zip | grep my_agent                      # must print something
+```
+
+Then import it by its generated class name (`my_test_agent` → `MyTestAgentAgent`) in the entry script.
+The copy is a fork, so later Designer edits do not reach the cluster — re-copy, or make the flattened
+module the source of truth.
+
+> Verify the flattened module *in the container*, not on your host: `flink_agents` is installed only
+> into the agents image, so `python -c "import ..."` on your laptop fails for a reason that has nothing
+> to do with the agent. Everything else in this runbook runs on the host or the gateway.
+
 ## Step 2. Build the Python environment on the gateway
 
 ```bash
