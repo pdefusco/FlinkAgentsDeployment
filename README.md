@@ -198,32 +198,46 @@ Do this first even if the Data Hub is your real target. It is the only place you
 agent in seconds instead of minutes, and it gives you a known-good baseline: if an agent fails on
 YARN but works here, the problem is the deployment, not the agent.
 
+Read that baseline narrowly, though. The local image runs **Flink 2.1.3**; a CSA 1.18 Data Hub runs
+**Flink 1.20.5**. The Flink Agents API is the same 0.3 in both, so a local pass really does establish
+that your agent's *logic* is sound — and establishes nothing whatsoever about the deployment. That is
+also why there are two cluster runner scripts rather than one redundant pair.
+
 ```bash
 git clone https://github.com/BrooksIan/FlinkDockerWithAgents.git
 cd FlinkDockerWithAgents
-pip install -e .            # installs the `ratatoskr` CLI (a Typer app)
-cp .env.example .env         # optional; sets FLINK_REST_PORT=8082 among others
+pip install -e .
+cp .env.example .env
 ```
+
+`pip install -e .` installs the `ratatoskr` CLI, a Typer app. The `.env` copy is optional; it sets
+`FLINK_REST_PORT=8082` among others.
 
 Build the image and start the cluster:
 
 ```bash
-ratatoskr build              # builds agent_flink_image from deploy/Dockerfile:
-                             #   clones apache/flink-agents at release-0.3 and installs
-                             #   its wheel + PyFlink INTO THE IMAGE
-ratatoskr up                 # docker compose -f deploy/docker-compose.yml up -d
-                             #   profile `minimal` = jobmanager + taskmanager
+ratatoskr build
+ratatoskr up
 ```
+
+`ratatoskr build` builds `agent_flink_image` from `deploy/Dockerfile`, which clones
+`apache/flink-agents` at `release-0.3` and installs its wheel plus PyFlink **into the image** — that is
+why `flink_agents` is importable in the container and not on your host. `ratatoskr up` is
+`docker compose -f deploy/docker-compose.yml up -d` with profile `minimal`, i.e. jobmanager +
+taskmanager.
 
 Confirm it came up, and submit the simplest agent:
 
 ```bash
 ratatoskr status
-ratatoskr agent list         # reads examples/agents/agent-manifest.yaml
+ratatoskr agent list
 ratatoskr doctor
 
 ratatoskr agent submit workflow_counter
 ```
+
+`agent list` reads `examples/agents/agent-manifest.yaml`, so an agent missing from that file is invisible
+to the CLI however well the module itself imports.
 
 `agent submit` copies the agent module, its cluster script, and the supporting `ratatoskr/` runtime
 into the `jobmanager` container, then runs `flink run -py <script>` inside it. The job appears at
@@ -340,10 +354,11 @@ cp .ratatoskr/agents/<def_id>/agent.py examples/agents/my_agent.py
 Find `<def_id>` in the shim's `_DEFINITION_ID`. That turns it into an ordinary module, which
 `build_csa_bundle.sh` then picks up with everything else in `examples/agents/*.py`. Import the class by
 its real name — the Designer suffixes it, so `my_test_agent` yields `MyTestAgentAgent` — then write the
-cluster entry script as in Part 4. Confirm it actually made it:
+cluster entry script as in Part 4. Confirm it actually made it — this must print a line; silence means
+the bundle does not contain your agent:
 
 ```bash
-unzip -l dist/csa/agentcode.zip | grep my_agent     # must print something
+unzip -l dist/csa/agentcode.zip | grep my_agent
 ```
 
 Being a copy rather than a link, it is now a fork: later Designer edits do **not** reach the cluster
@@ -399,13 +414,14 @@ it does not, PyFlink was stripped and there is no path — go to the Operator mo
 [Step 0](./flink-agents-on-csa-datahub.md#step-0-probe-the-cluster-before-building-anything).
 
 **Then probe the workers**, because the gateway is not where the job runs — and ssh from the gateway to
-the workers is refused, so the only way in is a YARN container:
+the workers is refused, so the only way in is a YARN container. The `DRY_RUN=1` pass prints the plan
+without submitting anything:
 
 ```bash
 scp datahub/scripts/probe_csa_workers.sh <os-user>@<gateway>:~/
 ssh <os-user>@<gateway>
 kinit <workload-user>
-DRY_RUN=1 bash ~/probe_csa_workers.sh    # show the plan first
+DRY_RUN=1 bash ~/probe_csa_workers.sh
 bash ~/probe_csa_workers.sh
 ```
 
@@ -434,12 +450,21 @@ thing this repo found. CSA nodes already ship a complete, version-matched pip-in
 is a thin `--system-site-packages` venv over the node's own stack, not a cross-built archive — **13 MB
 instead of 626 MB**, and matched by construction rather than by luck:
 
+Ship the wheel and the venv script, and **only** those. `dist/csa/` also contains `agentenv.tar.gz`, the
+superseded 650 MB conda archive — `scp -r` of the whole directory is the reflex to avoid. The `mkdir`
+matters: without it, `scp` of individual files into a directory that does not exist yet fails.
+
 ```bash
-scp -r dist/csa/ <os-user>@<gateway>:~/ratatoskr-csa/
-scp datahub/scripts/build_csa_venv_gateway.sh <os-user>@<gateway>:~/ratatoskr-csa/
+ssh <os-user>@<gateway> 'mkdir -p ~/ratatoskr-csa'
+scp dist/csa/wheel/flink_agents-*.whl datahub/scripts/build_csa_venv_gateway.sh \
+    <os-user>@<gateway>:~/ratatoskr-csa/
 ssh <os-user>@<gateway>
-cd ~/ratatoskr-csa && ./build_csa_venv_gateway.sh
+cd ~/ratatoskr-csa && chmod +x build_csa_venv_gateway.sh && ./build_csa_venv_gateway.sh
 ```
+
+This needs outbound internet on the gateway for a handful of light dependencies; `pyflink` and `pemja`
+come from the node's `/usr/local`, not from PyPI, which is the whole point of
+`--system-site-packages`.
 
 [Step 2](./flink-agents-on-csa-datahub.md#step-2-build-the-python-environment-on-the-gateway).
 
@@ -469,25 +494,45 @@ the Docker cluster script in three deliberate ways, all of which you should keep
 is copied by name**, though — the script has `cp examples/agents/run_workflow_cluster_csa.py` hardcoded
 — so either add a line for yours or copy it across by hand:
 
+`SKIP_DOCKER=1` rebuilds only `agentcode.zip` — seconds, not the tens of minutes the Maven and conda
+build takes.
+
 ```bash
-SKIP_DOCKER=1 datahub/scripts/build_csa_bundle.sh    # rebuilds only agentcode.zip, seconds not minutes
+SKIP_DOCKER=1 datahub/scripts/build_csa_bundle.sh
 cp examples/agents/run_my_agent_cluster_csa.py dist/csa/
-scp -r dist/csa/ <os-user>@<gateway>:~/ratatoskr-csa/
 ```
 
-**3. Inspect the command, then submit.**
+**3. Ship only what changed.** Do **not** `scp -r dist/csa/`. That directory also holds
+`agentenv.tar.gz`, ~650 MB of conda environment that *nothing* reads any more — it used to reach the
+TaskManagers via `-pyarch` and now ships nowhere (`submit_agent_csa.sh` explains this under "Why the
+archive is gone"). Three files change between submits, and the wheel is needed only the first time on a
+given gateway, by `build_csa_venv_gateway.sh`:
+
+```bash
+scp dist/csa/agentcode.zip dist/csa/run_my_agent_cluster_csa.py \
+    dist/csa/submit_agent_csa.sh <os-user>@<gateway>:~/ratatoskr-csa/
+```
+
+**4. Inspect the command, then submit.** `chmod` because plain `scp` does not reliably carry the exec
+bit. The `DRY_RUN=1` pass prints the `flink run` invocation without executing it and needs no Kerberos
+ticket, so run it before `kinit`:
 
 ```bash
 ssh <os-user>@<gateway>
-kinit <workload-user>
 cd ~/ratatoskr-csa
+chmod +x submit_agent_csa.sh
+ENTRY=run_my_agent_cluster_csa.py DRY_RUN=1 ./submit_agent_csa.sh
 
-ENTRY=run_my_agent_cluster_csa.py DRY_RUN=1 ./submit_agent_csa.sh   # print, don't submit
-ENTRY=run_my_agent_cluster_csa.py ./submit_agent_csa.sh             # submit
+kinit <workload-user>
+ENTRY=run_my_agent_cluster_csa.py ./submit_agent_csa.sh
 ```
 
 `DRY_RUN=1` is worth using every time. The script runs 18 preflight checks and prints the exact
 `flink run` invocation without executing it, which is where you catch a wrong `ENTRY` or a stale zip.
+
+One trace in the submit output is benign and looks alarming: an `IllegalStateException: Trying to
+access closed classloader` with `ShutdownHookManager` in the stack, printed *after* `Job has been
+submitted`. That is Hadoop tearing down the **client** JVM. The job is unaffected.
 
 Most of the submit script's inputs are auto-detected rather than defaulted, which matters when you
 read its source: `FLINK_HOME`, `FLINK_CONF_DIR` (from `/etc/flink/conf`, then
@@ -496,18 +541,129 @@ fallback value** — if detection fails the script exits rather than guessing. F
 set `KEYTAB` and `PRINCIPAL` together instead of relying on the `kinit` ticket cache. Every variable
 is tabulated in the [Script reference](./flink-agents-on-csa-datahub.md#script-reference).
 
-**4. Verify.** Take the `applicationId` from the submit output — do **not** try to find the job by
-name:
+**5. Verify — see it for yourself.** Take the `applicationId` from the submit output. Everything below
+runs on the gateway with a live ticket.
+
+*Never search for the job by name.* `JOB_NAME` in the submit script is cosmetic, used only for the
+script's own logging, and `yarn.application.name` is **ignored** in `yarn-per-job` mode:
+`YarnClusterDescriptor.deployJobCluster` hardcodes the YARN application name to `"Flink per-job
+cluster"`. Grepping for your agent's name will always come up empty — a genuinely confusing ten
+minutes if you don't know it. Pass `-appStates ALL` too, or a bounded job that has already finished
+will not appear, because the default listing shows only `RUNNING`/`ACCEPTED`/`SUBMITTED`:
 
 ```bash
-yarn logs -applicationId <applicationId> | grep doubled
+yarn application -list -appStates ALL | grep 'Flink per-job cluster'
+yarn application -status <applicationId>
 ```
 
-`JOB_NAME` in the submit script is cosmetic, used only for the script's own logging.
-`yarn.application.name` is **ignored** in `yarn-per-job` mode: `YarnClusterDescriptor.deployJobCluster`
-hardcodes the YARN application name to `"Flink per-job cluster"`. Grepping `yarn application -list`
-for your agent's name will always come up empty, and this is a genuinely confusing ten minutes if you
-don't know it.
+`-status` gives you `State`, `Final-State`, and — the useful part — `Tracking-URL`.
+
+**The Flink REST API survives the job, and this is the nicest way to prove a run.** The reasoning that
+says otherwise is seductive and wrong: a per-job cluster's JobManager *is* the YARN application master,
+so you would expect its REST API to die with the application, leaving only log greps. On CSA it does
+not, because the parcel runs a **Flink History Server** on the gateway
+(`org.apache.flink.runtime.webmonitor.history.HistoryServer`), and YARN's `Tracking-URL` for a
+*finished* application points at it rather than at the dead AM. Note the host and port move: the AM ran
+on a worker, but the tracking URL is the manager node at `historyserver.web.port`.
+
+Two settings in `/etc/flink/conf/flink-conf.yaml` decide how you call it, and guessing either one wastes
+time. Check them rather than assuming:
+
+```bash
+grep historyserver /etc/flink/conf/flink-conf.yaml
+```
+
+On CSA 1.18.0.0 they are `historyserver.web.ssl.enabled: true` and
+`historyserver.security.spnego.auth.enabled: false`. So it is **https, and it does not want SPNEGO** —
+the exact opposite of the reflex. Calling it over plain `http` fails as `curl: (52) Empty reply from
+server`, which reads like a dead port rather than a TLS mismatch. `-k` skips certificate verification,
+which is fine for a read-only look at your own job and not something to put in a script:
+
+```bash
+HS=$(yarn application -status <applicationId> 2>/dev/null | sed -n 's/.*Tracking-URL : //p' | tr -d ' ')
+curl -sk "$HS/jobs/overview" | python3 -m json.tool
+curl -sk "$HS/jobs/<jobId>" | python3 -m json.tool
+```
+
+`jobs/overview` lists every archived job with its `jid`, `name`, `state`, `duration` and task counts.
+The `name` is your `agents_env.execute("…")` string — it *is* honoured, which is worth holding next to
+the YARN application name that isn't. `jobs/<jid>` then gives the vertices, and this is the part worth
+reading closely, because it quantifies the run instead of merely asserting it. For the stock threshold
+agent:
+
+| Vertex | Status | `write-records` | `read-records` |
+|---|---|---|---|
+| `Source: Collection Source -> _stream_key_by_map_operator` | FINISHED | 3 | 0 |
+| `action-execute-operator -> Map, Map -> Sink: Print to Std. Out` | FINISHED | 0 | 3 |
+
+Three records left the source and three entered the agent operator. A deployment that submitted
+successfully but never ran your code shows the operator present with `read-records: 0`. Pair it with
+the exceptions endpoint, where `root-exception: null` and an empty `all-exceptions` is what a clean run
+looks like:
+
+```bash
+curl -sk "$HS/jobs/<jobId>/exceptions" | python3 -m json.tool
+```
+
+For a job that has already finished, the logs are the only record. Grep your **agent's** name, not a
+field name — the output shape is whatever your module emits:
+
+```bash
+yarn logs -applicationId <applicationId> | grep threshold_monitor
+```
+
+A `FINISHED`/`SUCCEEDED` application proves less than it appears to: it says the client submitted
+something and the cluster ran it to completion, not that *your* agent's code executed. Two greps give
+you that:
+
+```bash
+yarn logs -applicationId <applicationId> | grep 'taskmanager.Task' | grep 'INITIALIZING to RUNNING'
+yarn logs -applicationId <applicationId> | grep _output_event
+```
+
+Note what the first one is *not*: a bare `grep action-execute-operator` is the obvious thing to reach
+for and it is too loose. It also matches the JobManager's `ExecutionGraph` lines, and those only prove
+the JM *planned* the operator — a job that never obtained a slot still logs `CREATED to SCHEDULED`.
+Narrowing to `taskmanager.Task` isolates the worker's own log, and `INITIALIZING to RUNNING` is the
+transition that happens *after* the Python environment is built and pemja is loaded. Reaching `RUNNING`
+there means the JNI bridge came up and your `@action` is executing as a Python UDF on a worker. No
+client-side check can establish this — `pemja_core` cannot even be imported outside a JVM.
+
+That grep returns **two** lines, one per vertex: the collection source and then
+`action-execute-operator -> Map, Map -> Sink: Print to Std. Out`. Only the second is the proof you
+want — the source is plain Java and would reach `RUNNING` even if the Python side were broken.
+
+`_output_event` records are Flink Agents' own structured output, carrying the `jobId` and the
+`taskName`, which ties each emitted value to a specific execution rather than to a `print()` that could
+have come from anywhere. There are matching `_input_event` records, so you can read the whole
+input → output pairing for every element:
+
+```bash
+yarn logs -applicationId <applicationId> | grep -E '_input_event|_output_event'
+```
+
+One practical note: `yarn logs` and `yarn application` bury their output in INFO chatter — a `YARN_OPTS`
+deprecation warning and fifteen-plus `RangerRESTClient.init()` lines per invocation. Most of that is on
+stderr, so `2>/dev/null` removes it. Not all: a couple of Ranger lines are *inside* the aggregated
+container logs, because the TaskManager logged them itself, and no redirection will touch those. They
+are harmless.
+
+Because a green exit status is weak evidence, **design the test data so a wrong answer is visible** —
+inputs that straddle a threshold, rather than a single value. The stock runner's
+`[{"key": str(i), "value": i * 5} for i in range(1, 4)]` feeds 5/10/15 through a ×3 scale against a
+threshold of 20, so a correct run must print `OK`, `ALERT`, `ALERT` in that order. A run that prints
+three of the same thing ran *something*, but not this.
+
+While an application is still `RUNNING`, log aggregation retains only the live container, so a
+crash-looped app shows one attempt. Kill it first, then aggregate, to see them all.
+
+Locally (Part 1) the same questions are much easier, because the Docker JobManager's REST port is
+mapped and unauthenticated:
+
+```bash
+curl -s http://localhost:8082/jobs/overview | python3 -m json.tool
+curl -s http://localhost:8082/taskmanagers | python3 -m json.tool
+```
 
 **If the JobManager enters a crash loop with nothing in the logs naming Python, agents, or a jar**,
 read [The JobManager crash loop with no visible
@@ -537,6 +693,17 @@ And the flag syntax, one more time, because it costs more time than anything els
 
 Full usage for each script — every environment variable, default, and what it checks — is in the
 [Script reference](./flink-agents-on-csa-datahub.md#script-reference) section of the Data Hub runbook.
+
+> **`datahub/scripts/` in THIS repo is canonical.** To run them you copy them into a clone of the
+> agents project (they live at `scripts/` there, and each resolves `REPO_ROOT` as
+> `$(dirname "$BASH_SOURCE")/..`, so they work from either location without edits). That copy is a
+> **snapshot, not a link** — edit it and the fix never reaches here.
+>
+> This has already bitten once. On 2026-09-30 the two copies had drifted by 6–13 lines each, and the
+> clone's `build_csa_bundle.sh` was missing `docker cp "$CID:/out/wheel" "$OUT_DIR/"` — so a full
+> rebuild from it would silently produce a bundle with no wheel, and you would only find out on the
+> gateway when `build_csa_venv_gateway.sh` reports "no wheel found", after the scp. Fix here, then
+> re-copy; never the other direction.
 
 ## Status and provenance
 

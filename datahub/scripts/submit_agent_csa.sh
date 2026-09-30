@@ -716,15 +716,50 @@ cat <<EOF
 
 ==> Submitted. To inspect:
 
-    # Do NOT grep for the job name: in yarn-per-job mode YarnClusterDescriptor hardcodes
-    # the application name, so every submission appears as "Flink per-job cluster".
-    yarn application -list | grep 'Flink per-job cluster'
-    yarn logs -applicationId <appId> | grep doubled    # expects input/doubled records
+Do NOT grep for the job name: in yarn-per-job mode YarnClusterDescriptor hardcodes the
+application name, so every submission appears as "Flink per-job cluster". And pass
+-appStates ALL, because a bounded job has already FINISHED and the default listing shows
+only RUNNING/ACCEPTED/SUBMITTED:
 
-    # While an app is RUNNING, log aggregation retains only the live container, so a
-    # crash-looped app shows one attempt. Kill it first, then aggregate, to see them all.
+    yarn application -list -appStates ALL | grep 'Flink per-job cluster'
+    yarn logs -applicationId <appId> | grep <your agent name>
 
-Expect: {'input': 5, 'doubled': 10, 'agent': 'workflow_counter'} and 10/20, 15/30.
+Grep your AGENT's name, not a field name. The output shape is whatever your module
+emits; only the stock CounterAgent has an 'input'/'doubled' pair.
+
+A FINISHED/SUCCEEDED app proves less than you think. Beyond the print() lines,
+flink_agents emits structured _output_event JSON records carrying the jobId and a
+taskName. The real proof is the worker's own log reaching RUNNING on the agent operator:
+
+    yarn logs -applicationId <appId> 2>/dev/null \\
+      | grep 'taskmanager.Task' | grep 'action-execute-operator.*INITIALIZING to RUNNING'
+
+That transition happens AFTER the Python environment is built and pemja is loaded, so it
+means the JNI bridge came up and your @action ran as a Python UDF on a worker. NO
+client-side check can establish that — pemja_core cannot even be imported outside a JVM.
+Do not settle for a bare "grep action-execute-operator": it also matches the JobManager's
+ExecutionGraph lines, which only prove the operator was PLANNED.
+
+Better still, the REST API outlives the job. CSA runs a Flink History Server on the
+gateway, and YARN's Tracking-URL for a FINISHED app points at it, not at the dead AM:
+
+    HS=\$(yarn application -status <appId> 2>/dev/null | sed -n 's/.*Tracking-URL : //p' | tr -d ' ')
+    curl -sk "\$HS/jobs/overview" | python3 -m json.tool
+    curl -sk "\$HS/jobs/<jobId>" | python3 -m json.tool
+
+It is https and it does NOT want SPNEGO (historyserver.web.ssl.enabled: true,
+historyserver.security.spnego.auth.enabled: false in /etc/flink/conf/flink-conf.yaml —
+check yours). Over plain http you get "curl: (52) Empty reply from server", which reads
+like a dead port rather than a TLS mismatch. The per-vertex read-records/write-records
+counts are the quantitative version of the grep above: an operator with read-records 0
+was deployed but never fed. Unlike the YARN application name, the job name here is your
+own agents_env.execute("...") string.
+
+Either way, design the test data to make a wrong answer visible (e.g. inputs that
+straddle a threshold), rather than trusting the exit status.
+
+While an app is RUNNING, log aggregation retains only the live container, so a
+crash-looped app shows one attempt. Kill it first, then aggregate, to see them all.
 
 If it failed, the symptom table in the runbook maps each likely error to its fix. One
 symptom worth knowing in advance, because it looks like a broken archive and is not:

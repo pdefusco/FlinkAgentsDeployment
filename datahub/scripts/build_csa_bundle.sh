@@ -122,7 +122,7 @@ rm -rf "$STAGE/examples/agents/published_shims"
 # the copy inside the zip keeps the module importable by the same name on workers.
 cp examples/agents/run_workflow_cluster_csa.py "$OUT_DIR/"
 # The submit script runs from the bundle root (it cd's to its own directory, which is
-# where agentenv.tar.gz and jars/ must be), so it has to travel with the bundle.
+# where jars/ and the agentvenv must be), so it has to travel with the bundle.
 cp scripts/submit_agent_csa.sh "$OUT_DIR/"
 chmod +x "$OUT_DIR/submit_agent_csa.sh"
 
@@ -134,14 +134,33 @@ cat <<EOF
 
 ==> Next: ship to the gateway and submit
 
-    scp -r dist/csa/ <user>@<gateway>:~/ratatoskr-csa/
-    ssh <user>@<gateway>
+Do NOT ship agentenv.tar.gz. Nothing reads it — see "Why the archive is gone" in
+submit_agent_csa.sh. It is ~650MB of interpreter the cluster nodes already have.
+
+FIRST time on a given gateway, build the venv there (needs the wheel, and outbound
+internet for a few light dependencies):
+
+    ssh <user>@<gateway> 'mkdir -p ~/ratatoskr-csa'
+    scp dist/csa/wheel/flink_agents-*.whl scripts/build_csa_venv_gateway.sh \\
+        <user>@<gateway>:~/ratatoskr-csa/
+    ssh <user>@<gateway> 'cd ~/ratatoskr-csa && chmod +x build_csa_venv_gateway.sh && ./build_csa_venv_gateway.sh'
+
+EVERY time, including resubmits, only these three files change:
+
+    scp dist/csa/agentcode.zip dist/csa/run_workflow_cluster_csa.py \\
+        dist/csa/submit_agent_csa.sh <user>@<gateway>:~/ratatoskr-csa/
+
+Then, on the gateway. chmod because plain scp does not reliably carry the exec bit,
+and DRY_RUN first because it validates everything that does not need a ticket:
+
+    cd ~/ratatoskr-csa
+    chmod +x submit_agent_csa.sh
+    DRY_RUN=1 ./submit_agent_csa.sh
     kinit <user>
-    cd ~/ratatoskr-csa && DRY_RUN=1 ./submit_agent_csa.sh   # inspect the command first
-    cd ~/ratatoskr-csa && ./submit_agent_csa.sh             # then submit
+    ./submit_agent_csa.sh
 
 The submit script re-checks, on the gateway, the things that can only be checked there:
 that the parcel ships PyFlink at all, that the bundle's Flink minor matches the
-cluster's, and that the unpacked environment can import pemja/pyflink/flink_agents.
+cluster's, and that the venv can import pemja/pyflink/flink_agents against the parcel.
 
 EOF

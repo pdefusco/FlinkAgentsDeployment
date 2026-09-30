@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Cluster runner for ``workflow_counter`` on Cloudera CSA (Flink 1.20 on YARN).
+"""Cluster runner for a single agent on Cloudera CSA (Flink 1.20 on YARN).
 
-The CSA counterpart of ``run_workflow_cluster.py``. The pipeline is deliberately
-identical — from_collection -> apply(CounterAgent) -> print — so that any failure is
-attributable to the deployment, not to the agent. Differences from the Docker runner:
+Ships pointed at ``workflow_counter``, which is the smallest thing that can prove a
+deployment. To deploy your own agent, change the import and the ``apply(...)`` call to
+name it, and leave the pipeline shape alone — from_collection -> apply(<Agent>) ->
+print — so that any failure is attributable to the deployment, not to the agent.
+
+Note this filename is referenced in two places, so renaming it is not free:
+``scripts/build_csa_bundle.sh`` copies it into the bundle by name, and
+``scripts/submit_agent_csa.sh`` defaults ``ENTRY`` to it.
+
+The CSA counterpart of ``run_workflow_cluster.py``. Differences from the Docker runner:
 
 * No ``/opt/flink`` on sys.path. ``-pyfs agentcode.zip`` puts the shipped modules
   there; only this script's own directory needs adding, for a direct local run.
