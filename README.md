@@ -190,6 +190,10 @@ Parts 1–2 are the [`BrooksIan/FlinkDockerWithAgents`](https://github.com/Brook
 ("ratatoskr") project as its author designed it — nothing in this repo changes it. Parts 3–4 are this
 repo's addition.
 
+For a single run of all four parts with the real output — one agent, Designer to YARN container, plus the
+`yarn` and REST commands that prove it executed — see [Worked example:
+`threshold_monitor`](#worked-example-threshold_monitor-designer-to-yarn) at the end.
+
 ---
 
 ### Part 1. Get the agents project working locally
@@ -673,6 +677,246 @@ is a classpath-ordering flag, and the symptom points nowhere near the cause.
 
 And the flag syntax, one more time, because it costs more time than anything else here: **`-yD`, not
 `-D`.** On CSA every `-D` is silently discarded.
+
+---
+
+## Worked example: `threshold_monitor`, Designer to YARN
+
+Everything above is the general procedure. This section is one specific run of it, end to end, with the
+real output — done on 2026-09-30 against a CSA 1.18.0.0 Data Hub (Flink 1.20.5) in CDP Public Cloud. It
+exists so you can compare your own output to something known-good, and so the claims elsewhere in this
+README are attributable to a run rather than to reasoning.
+
+### Read this first: what the example does and does not do
+
+**`threshold_monitor` monitors nothing.** It is a deployment smoke test wearing monitoring vocabulary,
+and the distinction matters enough to state before the walkthrough rather than after. Its input is three
+integers hardcoded in the runner script. There is no NiFi flow, no Kafka topic, no external source of
+any kind — so when it emits `status: ALERT`, that is arithmetic on a constant, not a report about a
+system.
+
+That is the correct design for the job it has. The question being answered is *"did my Python agent code
+execute on a YARN TaskManager with the pemja JNI bridge loaded"*, and any real data source would add
+failure modes that muddy the answer. The threshold exists purely to make a **wrong** answer visible:
+three records straddling a boundary produce a distinctive `OK, ALERT, ALERT` signature, so a run that
+silently executed *different* code, or mangled the payload, prints something recognisably other. A
+single input value could not do that. Falsifiability, not surveillance.
+
+### The agent
+
+Authored in the Designer, then flattened to a plain module (see Part 2 for why the flattening is
+mandatory rather than stylistic). `examples/agents/threshold_monitor.py` in full is stdlib plus
+`flink_agents.api.*` and nothing else, which is what lets the identical file load under Flink 2.1.3
+locally and 1.20.5 on the cluster:
+
+```python
+SCALE = 3
+THRESHOLD = 20
+
+class ThresholdMonitorAgent(Agent):
+    @tool
+    @staticmethod
+    def scale(value: int) -> int:
+        return value * SCALE
+
+    @action(InputEvent.EVENT_TYPE)
+    @staticmethod
+    def process(event: Event, ctx: RunnerContext) -> None:
+        reading = _int_from_input(event)
+        scaled = ThresholdMonitorAgent.scale(reading)
+        status = "ALERT" if scaled > THRESHOLD else "OK"
+        ctx.send_event(OutputEvent(output={...}))
+```
+
+The runner supplies the input, and this one line is the whole data source:
+
+```python
+records = [{"key": str(i), "value": i * 5} for i in range(1, 4)]
+```
+
+`5, 10, 15` → scaled `15, 30, 45` → `OK, ALERT, ALERT`. Two alerts, zero systems observed.
+
+### How it got from a laptop to a YARN container
+
+```
+  LAPTOP                                    GATEWAY                      WORKER
+  ──────                                    ───────                      ──────
+  Designer
+     │ publish → shim in published_shims/
+     │          (shim is STRIPPED at build; flatten or you ship nothing)
+     ▼
+  examples/agents/threshold_monitor.py
+     │
+     │ build_csa_bundle.sh
+     │   ├─ docker build (linux/amd64) ─→ wheel + 2 dist jars
+     │   └─ zip ratatoskr/ + examples/ ─→ agentcode.zip
+     ▼
+  dist/csa/
+     │
+     │ scp  (3 files per submit; wheel once per gateway)
+     ▼
+                                     ~/ratatoskr-csa/
+                                       agentcode.zip
+                                       run_workflow_cluster_csa.py
+                                       submit_agent_csa.sh
+                                       agentvenv/   ← built HERE, from the
+                                                      wheel + the node's own
+                                                      PyFlink (13 MB, not 626)
+                                            │
+                                            │ submit_agent_csa.sh
+                                            │  18 preflight checks, then:
+                                            │  flink run -t yarn-per-job
+                                            │    -pyfs   agentcode.zip  ─────────┐
+                                            │    -py     run_..._csa.py          │
+                                            │    -pyexec /usr/bin/python3.11 ──┐ │
+                                            │    -pyclientexec agentvenv/...   │ │
+                                            ▼                                  │ │
+                                       YARN app                                │ │
+                                    "Flink per-job cluster"                    │ │
+                                                                               ▼ ▼
+                                                                     TaskManager JVM
+                                                                       pemja → CPython
+                                                                       runs @action
+```
+
+Two asymmetries in that picture are the whole trick. **`-pyexec` is the node's own
+`/usr/bin/python3.11`**, not the venv — the venv (`-pyclientexec`) is a *client-side* interpreter only.
+And **nothing Python-ish reaches the workers except `agentcode.zip`**; the 656 MB `agentenv.tar.gz` the
+build still produces is vestigial and ships nowhere. Both facts are why the gateway venv is built with
+`--system-site-packages`: `pyflink` and `pemja` must resolve to the *parcel's* versions, because those
+are what the TaskManagers will use.
+
+The submit script is where the accumulated scar tissue lives. It auto-detects `FLINK_HOME`,
+`FLINK_CONF_DIR` and `HADOOP_CLASSPATH` with **no fallback values** — if detection fails it exits rather
+than guessing — then runs 18 preflight checks before building the `flink run` invocation. `DRY_RUN=1`
+stops after printing that invocation and needs no Kerberos ticket, so it is the cheapest way to catch a
+wrong `ENTRY` or a stale zip.
+
+### The commands, and the actual output
+
+The submission, from `~/ratatoskr-csa` on the gateway:
+
+```bash
+DRY_RUN=1 ./submit_agent_csa.sh
+kinit <workload-user>
+./submit_agent_csa.sh
+```
+
+That yielded `application_1790640057726_0018`, whose AM landed on `worker2`. Finding it afterwards —
+note `-appStates ALL`, since a bounded job has already finished, and note that the grep is for the
+hardcoded name, never the agent's:
+
+```bash
+yarn application -list -appStates ALL | grep 'Flink per-job cluster'
+yarn application -status application_1790640057726_0018
+```
+
+```
+Application-Id  : application_1790640057726_0018
+Application-Name : Flink per-job cluster          ← not the job name. Always this.
+State : FINISHED    Final-State : SUCCEEDED    Progress : 100%
+AM Host : pdf-pwc-worker2...   RPC Port : 32775
+Tracking-URL : http://pdf-pwc-manager0...:18211   ← manager node, not the AM
+Log Aggregation Status : SUCCEEDED
+Aggregate Resource Allocation : 139962 MB-seconds, 44 vcore-seconds
+```
+
+**The agent's own output.** Grep your agent's name, not a field name — the shape is whatever your module
+emits:
+
+```bash
+yarn logs -applicationId application_1790640057726_0018 2>/dev/null | grep threshold_monitor
+```
+
+```
+{'reading': 5,  'scaled': 15, 'threshold': 20, 'status': 'OK',    'agent': 'threshold_monitor'}
+{'reading': 10, 'scaled': 30, 'threshold': 20, 'status': 'ALERT', 'agent': 'threshold_monitor'}
+{'reading': 15, 'scaled': 45, 'threshold': 20, 'status': 'ALERT', 'agent': 'threshold_monitor'}
+```
+
+`OK, ALERT, ALERT` in that order is the signature described above. Any other arrangement means something
+other than this code ran.
+
+**Proof the Python actually executed on a worker**, which the three lines above do *not* establish on
+their own — a `print()` looks the same wherever it came from:
+
+```bash
+yarn logs -applicationId application_1790640057726_0018 2>/dev/null \
+  | grep 'taskmanager.Task' | grep 'action-execute-operator.*INITIALIZING to RUNNING'
+```
+
+```
+2026-09-30 03:15:11,061 INFO org.apache.flink.runtime.taskmanager.Task [] -
+  action-execute-operator -> Map, Map -> Sink: Print to Std. Out (1/1)#0
+  switched from INITIALIZING to RUNNING.
+```
+
+`taskmanager.Task` means it is the worker's own log, not the JobManager's plan, and `INITIALIZING to
+RUNNING` is the transition that happens *after* the Python environment is built and pemja is loaded.
+
+**Input/output pairing**, from Flink Agents' structured events — each record carries the `jobId` and
+`taskName`, so values are tied to one execution:
+
+```bash
+yarn logs -applicationId application_1790640057726_0018 2>/dev/null | grep -E '_input_event|_output_event'
+```
+
+```
+"eventType":"_input_event",  "jobId":"7d3beda9...","attributes":{"input":{"key":"1","value":5}}
+"eventType":"_output_event", "jobId":"7d3beda9...","attributes":{"output":{"reading":5,"scaled":15,...,"status":"OK"}}
+"eventType":"_input_event",  "jobId":"7d3beda9...","attributes":{"input":{"key":"2","value":10}}
+"eventType":"_output_event", "jobId":"7d3beda9...","attributes":{"output":{"reading":10,"scaled":30,...,"status":"ALERT"}}
+```
+
+Incidentally, those `_input_event` records are also how you prove the *provenance* point at the top of
+this section: the inputs are `5, 10, 15`, the list comprehension, arriving from nowhere.
+
+**The durable view.** Per Part 4, the Flink History Server outlives the application:
+
+```bash
+HS=https://pdf-pwc-manager0...:18211
+curl -sk "$HS/jobs/overview" | python3 -m json.tool
+curl -sk "$HS/jobs/7d3beda905f51ee1bdfc7dde65a57c10" | python3 -m json.tool
+```
+
+```
+jid      : 7d3beda905f51ee1bdfc7dde65a57c10
+name     : Ratatoskr Threshold Monitor (CSA)    ← execute() name IS honoured here
+state    : FINISHED     duration : 15739 ms     tasks: 2 total / 2 finished / 0 failed
+
+Source: Collection Source -> _stream_key_by_map_operator   write-records 3, read-records 0
+action-execute-operator -> Map, Map -> Sink: Print to Std. Out   read-records 3, write-records 0
+
+/exceptions →  root-exception: null,  all-exceptions: []
+```
+
+`read-records: 3` on the agent vertex is the strongest single number here. An agent that was deployed
+but never fed — the failure mode the stripped-`published_shims` trap produces — shows the vertex present
+with `read-records: 0`, and a green `SUCCEEDED` beside it.
+
+### Next: pointing an agent at a real NiFi flow
+
+The obvious follow-on is an agent that watches a live NiFi flow in CDF Data Service in the same CDP
+environment. The agents project already ships one — `examples/agents/workflow_nifi_monitor.py`
+(`NiFiMonitorAgent`) with `run_workflow_nifi_monitor_cluster.py`, which supports a Kafka source, a
+periodic tick, or N polls. Its architecture is worth noting because it is *not* the obvious one: the
+Flink stream is a **clock**, and the agent calls the NiFi REST API itself from inside its tools, via
+`ratatoskr.nifi.client.NiFiClient`.
+
+**One blocker to clear first, and it fails in the worst possible way.** `build_csa_bundle.sh` stages an
+explicit allowlist of `ratatoskr` submodules into `agentcode.zip` — `constants`, `paths`, `flink_rest`,
+`kafka_sources`, plus `runtime/` and part of `agents/`. **`ratatoskr/nifi/` is not on that list**, so it
+ships zero files. And because `workflow_nifi_monitor.py` imports `ratatoskr.nifi.client` *inside* its
+tool functions rather than at module top level, nothing fails at submit time: the job goes green, reaches
+a worker, and dies with `ModuleNotFoundError: No module named 'ratatoskr.nifi'` at action time. Same
+shape as the flattening trap — a deployment that looks successful while running code that cannot work.
+
+So the sequence is: add `ratatoskr/nifi/` to the bundle's staging list, confirm it appears in
+`unzip -l dist/csa/agentcode.zip`, then work out NiFi endpoint reachability and auth from a YARN
+container — which is a genuinely separate problem, since workers reach neither the gateway's
+`~/.kube`-style local config nor anything that inherits your interactive Kerberos ticket. Also note that
+a Kafka-sourced or tick-driven job is **unbounded**, so it stays `RUNNING`: the live JobManager REST API
+becomes reachable through the YARN proxy and the History Server stops being the only window.
 
 ---
 
