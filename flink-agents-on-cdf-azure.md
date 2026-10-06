@@ -7,10 +7,10 @@ The design has two kinds of agents. **Workflow agents** are deterministic and ru
 ```
 Cloudera DataFlow (CDP Public Cloud, Azure)          Your AKS cluster (same VNet)
 ┌───────────────────────────────┐                   ┌──────────────────────────────────┐
-│  NiFi flow deployments         │  NiFi REST / Knox │  CSA Operator                      │
+│  NiFi flow deployments         │ Inbound Conn mTLS │  CSA Operator                      │
 │  Data Hub Kafka (9093)         │◀─────────────────▶│    └─ flink-agents FlinkDeployment │
 │  DataFlow service (control     │  Kafka SASL_SSL   │         Workflow + ReAct agents    │
-│  plane API)                    │  Control Plane API│         run here as Flink jobs     │
+│  plane API)                    │  df / dfworkload  │         run here as Flink jobs     │
 └───────────────────────────────┘                   │            │                       │
                                                      │            ▼                       │
                                                      │   Cloudera AI Inference (ReAct)    │
@@ -25,7 +25,8 @@ Cloudera DataFlow (CDP Public Cloud, Azure)          Your AKS cluster (same VNet
 - A **customer-managed AKS cluster** in the same Azure subscription, peered to the VNet your CDP environment runs in, so in-VNet hostnames and the Data Hub brokers are reachable.
 - `kubectl` and `helm` (v3) configured against that AKS cluster, and an **Azure Container Registry (ACR)** the cluster can pull from.
 - A **Cloudera license file** and credentials for `container.repository.cloudera.com` (the Cloudera image registry).
-- A **CDP workload user** and **workload password** from the Management Console, used for both the NiFi REST and Kafka paths.
+- A **CDP workload user** and **workload password** from the Management Console, used for the Kafka path.
+- A **CDP access key pair** (access key ID + private key, Management Console → User Management), used by `cdp df` for deployment status and KPIs. This is a different credential from the workload password — the DataFlow APIs do not accept the latter.
 - For ReAct agents, a **Cloudera AI Inference** endpoint serving a chat model, plus a Knox JWT or Knox API key to call it.
 
 ---
@@ -55,7 +56,8 @@ pip install cdpcli
 cdp configure                      # access key + private key from Management Console → User Management
 cdp iam get-user                   # confirm auth
 
-# Set the workload password — the Kafka and NiFi REST paths both use it
+# Set the workload password — the Kafka path uses it
+# (the df/dfworkload APIs authenticate with the access key pair from `cdp configure`, not this)
 cdp iam set-workload-password --password '<workload-password>'
 ```
 
@@ -132,13 +134,17 @@ cdp environments sync-all-users
 ```
 
 Environment creation takes 20–40 minutes, most of it FreeIPA. The Data Lake is what brings up Ranger
-and Knox, and Knox is what the DataFlow and AI Inference calls in Steps 4 and 5 go through.
+and Knox, and Knox is what the AI Inference calls in Step 5 go through. The DataFlow calls in Step 4
+do **not** use Knox — `cdp df` is a public CDP API authenticated with your access key pair.
 
 ### 4. Create the AKS cluster and ACR
 
 This is the part that has no CDP equivalent — on this path **you own the Kubernetes cluster**. Put it
 in the same VNet as the CDP environment if you can, or peer it; the agents need to reach the Data Hub
-Kafka brokers and the NiFi REST endpoint over in-VNet hostnames.
+Kafka brokers over in-VNet hostnames, and the `cdp dfworkload` gateway resolves to a private
+`internal-*` address that is only reachable from inside the VNet. See
+[`cdf-monitoring-apis.md`](./cdf-monitoring-apis.md) for which monitoring calls need that reach and
+which work from anywhere.
 
 ```bash
 az acr create --resource-group <rg> --name <youracr> --sku Standard
@@ -183,7 +189,7 @@ drops traffic. Check both.
 
 ### 5. Create the DataFlow service and a Data Hub for Kafka
 
-The agents in Step 4 read from Kafka and call the NiFi REST API, so both need to exist:
+The agents in Step 4 read from Kafka and query the DataFlow APIs, so both need to exist:
 
 ```bash
 # DataFlow (CDF) on the environment
@@ -451,14 +457,12 @@ compensate for was settled when you built the image — which is the whole argum
 
 There are three integration surfaces, and most deployments use more than one. Take them in the order below.
 
-### Watch and heal the flow over the NiFi REST API
+### Reaching the flow itself
 
-Agents reach the NiFi flow through its REST API to read processor state, queue depth, and bulletins, and (only after Step 5's approval gate) to change run status. There are two ways in.
+- **DataFlow Inbound Connections.** A CDF flow deployment can expose a stable public hostname with TLS/mTLS auto-provisioned. The listen processor uses a `StandardRestrictedSSLContextService` named **exactly** `Inbound SSL Context Service`, which CDF auto-populates at deployment. This is the clean edge path when the agent needs to push data to the flow from outside the VNet.
+- **The NiFi REST API is not available on DFX Public Cloud.** Four headless auth routes to `/nifi-api` were probed on a live deployment (2026-10-05) and all four are closed: the CDP workload token is RS256 where NiFi's verifier demands EdDSA; `/access/token` with user+password returns HTTP 409 "not supported"; SAML2 offers only a browser redirect; and mTLS terminates at a proxy that trusts only the Let's Encrypt public root. **Knox fronting is a Data Hub NiFi property, not a DFX one** — do not plan a monitoring loop around processor status, connection queues or the bulletin board. Those signals come from the DataFlow APIs instead; see [`cdf-monitoring-apis.md`](./cdf-monitoring-apis.md) for what they do and do not expose.
 
-- **DataFlow Inbound Connections.** A CDF flow deployment can expose a stable public hostname with TLS/mTLS auto-provisioned. The listen processor uses a `StandardRestrictedSSLContextService` named **exactly** `Inbound SSL Context Service`, which CDF auto-populates at deployment. This is the clean edge path when the agent needs to push data or reach the flow from outside the VNet.
-- **NiFi REST through Knox.** For read-only monitoring, authenticate to the flow's NiFi API with your workload user through the environment's Knox gateway and call the read endpoints (processor status, connection queues, bulletin board).
-
-Keep the monitor phase on **read-only** endpoints. When a heal action does write, follow the two rules below without exception.
+Keep the monitor phase on **read-only** calls. The two rules below apply wherever an agent does write to NiFi — on Data Hub, or through an Inbound Connection — and they are the reason the heal gate in Step 5 exists.
 
 - **Never GET-then-PUT a NiFi processor that has sensitive properties.** NiFi masks a sensitive value as `********` on read. PUT it back and that literal overwrites the real credential and destroys it. Change run status through the narrow `/processors/{id}/run-status` endpoint, or manage the value in a **Parameter Context**, never a full-entity PUT.
 - **Put credentials in a Parameter Context**, not in a processor property and not in the FlinkDeployment YAML.
@@ -475,9 +479,37 @@ sasl.mechanism=PLAIN
 
 Import the environment's FreeIPA certificate into the client truststore with `keytool`, and take the broker hostnames from Cloudera Manager for that cluster. Agents subscribe to the topic the flow writes and publish their enriched output to a topic of your choosing.
 
-### Deployment health from the DataFlow Control Plane API
+### Flow and deployment monitoring from the DataFlow APIs
 
-The flow's own state is not the whole picture; the deployment's health is a separate signal. Query the **CDP DataFlow service API** with a CDP access key to read deployment status and KPIs, and feed that into the agents as a distinct input from the NiFi-flow-level view.
+With `/nifi-api` closed, this is the monitoring surface. It is more capable than "deployment is up or
+down": the DataFlow APIs expose five KPI scope types, so **processor-, process-group- and
+connection-level metrics are all available** —
+
+```
+SYSTEM · NIFI_FLOW · NIFI_PROCESSOR · NIFI_PROCESS_GROUP · NIFI_CONNECTION
+```
+
+Two constraints shape how an agent uses them:
+
+- **Per-component metrics exist only where a KPI was configured.** There is no "read all processors"
+  call in either API. `SYSTEM` and `NIFI_FLOW` metrics need no setup; the other three require a KPI
+  targeting that specific component. Decide what to watch at design time, not at alert time.
+- **Reads and writes sit on different networks.** `cdp df` is the public control plane and works from
+  anywhere — so a laptop or an agent outside the VNet can read KPI values and deployment state.
+  `cdp dfworkload` resolves to a private `internal-*` ELB, so the metric catalogue and every KPI
+  mutation are VPC-bound. An agent that only reads can run anywhere; one that configures KPIs cannot.
+
+```bash
+cdp df list-flow-kpis-in-deployment \
+  --deployment-crn "$DEPLOYMENT_CRN" \
+  --deployed-flow-crn "$DEPLOYED_FLOW_CRN" \
+  --metrics-time-period LAST_THIRTY_MINUTES | jq '.metricCharts'
+```
+
+Feed this in as a distinct agent input from the Kafka data plane. **[`cdf-monitoring-apis.md`](./cdf-monitoring-apis.md)
+is the full reference** — the metric chart shape, the 25-bucket trap that makes cross-request
+differencing wrong by ~20%, how to discover the metric catalogue, the KPI write path, and the
+workarounds for what the APIs do not cover.
 
 ---
 
@@ -538,6 +570,8 @@ The operator route lets you pin `flink:1.20.5-java17` directly and is supported,
 ## What NOT to do
 
 - **Don't expose a Kafka broker directly when Inbound Connections will do.** The Inbound Connection gives you a public hostname with auto-provisioned mTLS and no broker exposure. Reach for the direct 9093 path only when a flow is not in the picture.
+- **Don't plan on the NiFi REST API for DFX monitoring.** `/nifi-api` has no working headless auth route on DFX Public Cloud (four probed, four closed, 2026-10-05), and Knox does not front it the way it fronts Data Hub NiFi. Build the monitor phase on `cdp df` instead.
+- **Don't assume a `cdp dfworkload` failure is a credential problem.** It is almost always the network — that gateway is VPC-only. The tell: a printed workload-token expiry *followed by* a hang is network; a failure with no expiry line is the credential case.
 - **Don't GET-then-PUT a NiFi processor with sensitive properties.** The masked `********` writes back as a literal and destroys the credential. Use `/run-status` or a Parameter Context.
 - **Don't hardcode credentials in the FlinkDeployment YAML.** Inject them as environment or secret references, and keep flow credentials in a NiFi Parameter Context.
 - **Don't call Cloudera AI Inference "GA."** State it as available, and do not attach a maturity label it does not carry.
@@ -547,6 +581,7 @@ The operator route lets you pin `flink:1.20.5-java17` directly and is supported,
 ## References
 
 - [Cloudera DataFlow Inbound Connections](https://docs.cloudera.com/dataflow/cloud/about-inbound-connections.html) · [Configuring inbound connection support](https://docs.cloudera.com/dataflow/cloud/develop-flow-definitions/topics/cdf-configuring-inbound-connection-support.html)
+- DataFlow API reference: [`df` (control plane)](https://cloudera.github.io/cdp-dev-docs/api-docs/df/index.html) · [`dfworkload`](https://cloudera.github.io/cdp-dev-docs/api-docs/dfworkload/index.html). Both HTML pages **truncate before the KPI and metric schemas** — the OpenAPI YAML bundled with `cdpcli` (`cdpcli/data/df/df.yaml`, `cdpcli/data/dfworkload/dfworkload.yaml`) is the complete source. See [`cdf-monitoring-apis.md`](./cdf-monitoring-apis.md).
 - [Connecting Kafka clients outside the VPC](https://docs.cloudera.com/cdf-datahub/7.3.1/connecting-kafka/topics/kafka-dh-connect-clients-outside-vpc.html)
 - [Cloudera AI Inference authentication](https://docs.cloudera.com/machine-learning/cloud/ai-inference/topics/ml-caii-authentication.html) · [Making a call with the OpenAI API](https://docs.cloudera.com/machine-learning/cloud/ai-inference/topics/ml-caii-make-inference-call-model-endpoint-with-openai-api.html)
 - [Apache Flink Agents](https://github.com/apache/flink-agents) · [Flink Agents deployment docs (0.3)](https://nightlies.apache.org/flink/flink-agents-docs-release-0.3/docs/operations/deployment/)

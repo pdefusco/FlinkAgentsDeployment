@@ -8,6 +8,8 @@ the traps, for each.
   **Data Hub** (VMs, YARN). Verified end to end on AWS.
 - **[flink-agents-on-cdf-azure.md](./flink-agents-on-cdf-azure.md)** — **CSA Operator** on your own
   Kubernetes (AKS), wired to Cloudera DataFlow.
+- **[cdf-monitoring-apis.md](./cdf-monitoring-apis.md)** — what the DataFlow `df`/`dfworkload` APIs
+  can and cannot tell you about a running NiFi flow. Read this before building a monitor.
 - **[datahub/](./datahub/)** — the working scripts and job for the Data Hub path.
 
 **New to this?** Start with the [walkthrough](#walkthrough-from-the-agents-project-to-a-running-agent-on-csa)
@@ -926,6 +928,7 @@ becomes reachable through the YARN proxy and the History Server stops being the 
 |---|---|
 | [`flink-agents-on-csa-datahub.md`](./flink-agents-on-csa-datahub.md) | Data Hub runbook: AWS + CDP infra from scratch, build, submit, every trap found |
 | [`flink-agents-on-cdf-azure.md`](./flink-agents-on-cdf-azure.md) | Operator runbook: Azure + AKS infra from scratch, image build, `FlinkDeployment`, DataFlow and AI Inference integration |
+| [`cdf-monitoring-apis.md`](./cdf-monitoring-apis.md) | What the DataFlow `df`/`dfworkload` APIs can and cannot tell you about a running NiFi flow — the five KPI scope types, the metric chart shape, the control/workload network split, and the gaps |
 | [`datahub/scripts/probe_csa_gateway.sh`](./datahub/scripts/probe_csa_gateway.sh) | Go/no-go probes. **Run this first** — it can kill the approach in ten minutes |
 | [`datahub/scripts/probe_csa_workers.sh`](./datahub/scripts/probe_csa_workers.sh) | Verifies the PyFlink runtime on **every worker**, inside a real YARN container. The only script here that submits an application |
 | [`datahub/scripts/build_csa_bundle.sh`](./datahub/scripts/build_csa_bundle.sh) | Builds the Flink Agents jars + wheel (local, `linux/amd64`) |
@@ -955,6 +958,7 @@ Full usage for each script — every environment variable, default, and what it 
 |---|---|
 | Data Hub path | **Verified end to end** 2026-09-29 — CSA 1.18.0.0, Flink 1.20.5, Runtime 7.3.2, Java 17, RAZ-enabled, S3. `workflow_counter` FINISHED/SUCCEEDED in one AM attempt |
 | Operator path | Written from Cloudera's documented behaviour and the CSA Operator chart. **Not** verified end to end in this repo — treat the commands as a starting point, not a tested script |
+| CDF monitoring APIs | Spec-derived from the OpenAPI YAML bundled with **cdpcli 0.9.164**; network planes, KPI bucketing and the `/nifi-api` auth probes **measured 2026-10-05**; Prometheus `/federate` reachability **unverified** |
 | Flink Agents | `release-0.3` / `0.3.1`, built from source. `0.3-SNAPSHOT` artifacts, no release guarantee |
 | Agents source project | [`BrooksIan/FlinkDockerWithAgents`](https://github.com/BrooksIan/FlinkDockerWithAgents) ("ratatoskr") — the agents themselves, and the local Docker path they were developed on |
 
